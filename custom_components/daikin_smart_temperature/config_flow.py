@@ -7,18 +7,57 @@ from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 
 from .const import (
-    DOMAIN, DAIKIN_DOMAIN,
-    CONF_DEVICE_ID, CONF_TARGET_TEMP, CONF_TOLERANCE,
-    CONF_MIN_TEMP, CONF_MAX_TEMP, CONF_POLL_INTERVAL,
-    CONF_MODE_SWITCH_MIN, CONF_OVERRIDE_TIMEOUT,
+    DOMAIN,
+    DAIKIN_DOMAIN,
+    CONF_DEVICE_ID,
+    CONF_TARGET_TEMP,
+    CONF_TOLERANCE,
+    CONF_MIN_TEMP,
+    CONF_MAX_TEMP,
+    CONF_POLL_INTERVAL,
+    CONF_MODE_SWITCH_MIN,
+    CONF_OVERRIDE_TIMEOUT,
     CONF_LEARNING_ENABLED,
-    CONF_MORNING_OFFSET, CONF_DAY_OFFSET, CONF_EVENING_OFFSET, CONF_NIGHT_OFFSET,
-    CONF_FAN_CLOSE_DELTA, CONF_FAN_MID_DELTA,
-    DEFAULT_TARGET_TEMP, DEFAULT_TOLERANCE, DEFAULT_MIN_TEMP, DEFAULT_MAX_TEMP,
-    DEFAULT_POLL_INTERVAL, DEFAULT_MODE_SWITCH_MIN, DEFAULT_OVERRIDE_TIMEOUT,
+    CONF_MORNING_OFFSET,
+    CONF_DAY_OFFSET,
+    CONF_EVENING_OFFSET,
+    CONF_NIGHT_OFFSET,
+    CONF_FAN_CLOSE_DELTA,
+    CONF_FAN_MID_DELTA,
+    CONF_ALLOW_COOL,
+    CONF_ALLOW_HEAT,
+    CONF_ALLOW_FAN_ONLY,
+    CONF_MAX_FAN_MODE,
+    CONF_SEASON_MODE,
+    CONF_SUMMER_HEAT_MIN_TEMP,
+    CONF_SUMMER_HEAT_NIGHT_ONLY,
+    DEFAULT_TARGET_TEMP,
+    DEFAULT_TOLERANCE,
+    DEFAULT_MIN_TEMP,
+    DEFAULT_MAX_TEMP,
+    DEFAULT_POLL_INTERVAL,
+    DEFAULT_MODE_SWITCH_MIN,
+    DEFAULT_OVERRIDE_TIMEOUT,
     DEFAULT_LEARNING_ENABLED,
-    DEFAULT_MORNING_OFFSET, DEFAULT_DAY_OFFSET, DEFAULT_EVENING_OFFSET, DEFAULT_NIGHT_OFFSET,
-    DEFAULT_FAN_CLOSE_DELTA, DEFAULT_FAN_MID_DELTA,
+    DEFAULT_MORNING_OFFSET,
+    DEFAULT_DAY_OFFSET,
+    DEFAULT_EVENING_OFFSET,
+    DEFAULT_NIGHT_OFFSET,
+    DEFAULT_FAN_CLOSE_DELTA,
+    DEFAULT_FAN_MID_DELTA,
+    DEFAULT_ALLOW_COOL,
+    DEFAULT_ALLOW_HEAT,
+    DEFAULT_ALLOW_FAN_ONLY,
+    DEFAULT_MAX_FAN_MODE,
+    DEFAULT_SEASON_MODE,
+    DEFAULT_SUMMER_HEAT_MIN_TEMP,
+    DEFAULT_SUMMER_HEAT_NIGHT_ONLY,
+    FAN_CAP_AUTO,
+    FAN_CAP_LOW,
+    FAN_CAP_MEDIUM,
+    FAN_CAP_HIGH,
+    SEASON_NORMAL,
+    SEASON_SUMMER,
 )
 
 
@@ -32,7 +71,7 @@ class DaikinSmartTempConfigFlow(ConfigFlow, domain=DOMAIN):
 
         daikin_data = self.hass.data.get(DAIKIN_DOMAIN, {})
         devices: dict[str, str] = {}
-        for entry_id, coordinators in daikin_data.items():
+        for _, coordinators in daikin_data.items():
             for coord in coordinators:
                 devices[coord.device_id] = coord.device_name
 
@@ -55,38 +94,66 @@ class DaikinSmartTempConfigFlow(ConfigFlow, domain=DOMAIN):
     @staticmethod
     @callback
     def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
-        return DaikinSmartTempOptionsFlow(config_entry)
+        return DaikinSmartTempOptionsFlow()
 
 
 class DaikinSmartTempOptionsFlow(OptionsFlow):
-    """Options flow — all tuning params editable from the UI.
-
-    Uses self.config_entry (live HA property) instead of a stale
-    entry snapshot stored in __init__, so defaults always reflect
-    the current saved values.
-    """
+    """Options flow."""
 
     async def async_step_init(self, user_input=None) -> FlowResult:
-        if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+        errors: dict[str, str] = {}
 
-        # self.config_entry is the LIVE entry provided by HA's OptionsFlow base
+        if user_input is not None:
+            if user_input[CONF_MIN_TEMP] > user_input[CONF_MAX_TEMP]:
+                errors["base"] = "invalid_temp_range"
+            elif not (
+                user_input[CONF_ALLOW_COOL]
+                or user_input[CONF_ALLOW_HEAT]
+                or user_input[CONF_ALLOW_FAN_ONLY]
+            ):
+                errors["base"] = "at_least_one_hvac_mode"
+            else:
+                return self.async_create_entry(title="", data=user_input)
+
         o = self.config_entry.options
 
         schema = vol.Schema({
-            vol.Optional(CONF_TARGET_TEMP,      default=o.get(CONF_TARGET_TEMP,      DEFAULT_TARGET_TEMP)):      vol.Coerce(float),
-            vol.Optional(CONF_TOLERANCE,        default=o.get(CONF_TOLERANCE,        DEFAULT_TOLERANCE)):        vol.Coerce(float),
-            vol.Optional(CONF_MIN_TEMP,         default=o.get(CONF_MIN_TEMP,         DEFAULT_MIN_TEMP)):         vol.Coerce(float),
-            vol.Optional(CONF_MAX_TEMP,         default=o.get(CONF_MAX_TEMP,         DEFAULT_MAX_TEMP)):         vol.Coerce(float),
+            vol.Optional(CONF_TARGET_TEMP, default=o.get(CONF_TARGET_TEMP, DEFAULT_TARGET_TEMP)): vol.Coerce(float),
+            vol.Optional(CONF_TOLERANCE, default=o.get(CONF_TOLERANCE, DEFAULT_TOLERANCE)): vol.Coerce(float),
+            vol.Optional(CONF_MIN_TEMP, default=o.get(CONF_MIN_TEMP, DEFAULT_MIN_TEMP)): vol.Coerce(float),
+            vol.Optional(CONF_MAX_TEMP, default=o.get(CONF_MAX_TEMP, DEFAULT_MAX_TEMP)): vol.Coerce(float),
+
+            vol.Optional(CONF_ALLOW_COOL, default=o.get(CONF_ALLOW_COOL, DEFAULT_ALLOW_COOL)): bool,
+            vol.Optional(CONF_ALLOW_HEAT, default=o.get(CONF_ALLOW_HEAT, DEFAULT_ALLOW_HEAT)): bool,
+            vol.Optional(CONF_ALLOW_FAN_ONLY, default=o.get(CONF_ALLOW_FAN_ONLY, DEFAULT_ALLOW_FAN_ONLY)): bool,
+            vol.Optional(CONF_MAX_FAN_MODE, default=o.get(CONF_MAX_FAN_MODE, DEFAULT_MAX_FAN_MODE)): vol.In(
+                [FAN_CAP_AUTO, FAN_CAP_LOW, FAN_CAP_MEDIUM, FAN_CAP_HIGH]
+            ),
+
+            vol.Optional(CONF_SEASON_MODE, default=o.get(CONF_SEASON_MODE, DEFAULT_SEASON_MODE)): vol.In(
+                [SEASON_NORMAL, SEASON_SUMMER]
+            ),
+            vol.Optional(
+                CONF_SUMMER_HEAT_MIN_TEMP,
+                default=o.get(CONF_SUMMER_HEAT_MIN_TEMP, DEFAULT_SUMMER_HEAT_MIN_TEMP),
+            ): vol.Coerce(float),
+            vol.Optional(
+                CONF_SUMMER_HEAT_NIGHT_ONLY,
+                default=o.get(CONF_SUMMER_HEAT_NIGHT_ONLY, DEFAULT_SUMMER_HEAT_NIGHT_ONLY),
+            ): bool,
+
             vol.Optional(CONF_LEARNING_ENABLED, default=o.get(CONF_LEARNING_ENABLED, DEFAULT_LEARNING_ENABLED)): bool,
-            vol.Optional(CONF_MORNING_OFFSET,   default=o.get(CONF_MORNING_OFFSET,   DEFAULT_MORNING_OFFSET)):   vol.Coerce(float),
-            vol.Optional(CONF_DAY_OFFSET,       default=o.get(CONF_DAY_OFFSET,       DEFAULT_DAY_OFFSET)):       vol.Coerce(float),
-            vol.Optional(CONF_EVENING_OFFSET,   default=o.get(CONF_EVENING_OFFSET,   DEFAULT_EVENING_OFFSET)):   vol.Coerce(float),
-            vol.Optional(CONF_NIGHT_OFFSET,     default=o.get(CONF_NIGHT_OFFSET,     DEFAULT_NIGHT_OFFSET)):     vol.Coerce(float),
-            vol.Optional(CONF_FAN_CLOSE_DELTA,  default=o.get(CONF_FAN_CLOSE_DELTA,  DEFAULT_FAN_CLOSE_DELTA)):  vol.Coerce(float),
-            vol.Optional(CONF_FAN_MID_DELTA,    default=o.get(CONF_FAN_MID_DELTA,    DEFAULT_FAN_MID_DELTA)):    vol.Coerce(float),
-            vol.Optional(CONF_POLL_INTERVAL,    default=o.get(CONF_POLL_INTERVAL,    DEFAULT_POLL_INTERVAL)):    vol.All(vol.Coerce(int), vol.Range(min=30)),
-            vol.Optional(CONF_MODE_SWITCH_MIN,  default=o.get(CONF_MODE_SWITCH_MIN,  DEFAULT_MODE_SWITCH_MIN)):  vol.All(vol.Coerce(int), vol.Range(min=60)),
+            vol.Optional(CONF_MORNING_OFFSET, default=o.get(CONF_MORNING_OFFSET, DEFAULT_MORNING_OFFSET)): vol.Coerce(float),
+            vol.Optional(CONF_DAY_OFFSET, default=o.get(CONF_DAY_OFFSET, DEFAULT_DAY_OFFSET)): vol.Coerce(float),
+            vol.Optional(CONF_EVENING_OFFSET, default=o.get(CONF_EVENING_OFFSET, DEFAULT_EVENING_OFFSET)): vol.Coerce(float),
+            vol.Optional(CONF_NIGHT_OFFSET, default=o.get(CONF_NIGHT_OFFSET, DEFAULT_NIGHT_OFFSET)): vol.Coerce(float),
+
+            vol.Optional(CONF_FAN_CLOSE_DELTA, default=o.get(CONF_FAN_CLOSE_DELTA, DEFAULT_FAN_CLOSE_DELTA)): vol.Coerce(float),
+            vol.Optional(CONF_FAN_MID_DELTA, default=o.get(CONF_FAN_MID_DELTA, DEFAULT_FAN_MID_DELTA)): vol.Coerce(float),
+
+            vol.Optional(CONF_POLL_INTERVAL, default=o.get(CONF_POLL_INTERVAL, DEFAULT_POLL_INTERVAL)): vol.All(vol.Coerce(int), vol.Range(min=30)),
+            vol.Optional(CONF_MODE_SWITCH_MIN, default=o.get(CONF_MODE_SWITCH_MIN, DEFAULT_MODE_SWITCH_MIN)): vol.All(vol.Coerce(int), vol.Range(min=60)),
             vol.Optional(CONF_OVERRIDE_TIMEOUT, default=o.get(CONF_OVERRIDE_TIMEOUT, DEFAULT_OVERRIDE_TIMEOUT)): vol.All(vol.Coerce(int), vol.Range(min=0)),
         })
-        return self.async_show_form(step_id="init", data_schema=schema)
+
+        return self.async_show_form(step_id="init", data_schema=schema, errors=errors)
