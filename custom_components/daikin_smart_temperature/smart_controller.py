@@ -13,6 +13,10 @@ Key design decisions:
     evaluation runs immediately after HA finishes starting up.
   - Always resolves the live ConfigEntry via entry_id so options changes
     take effect on the next poll without a reload.
+  - Respects allow_cool / allow_heat / allow_fan_only toggles.
+  - Caps fan speed at max_fan_mode.
+  - Summer season logic: heating is suppressed unless the house has
+    dropped to/below summer_heat_min_temp, and (optionally) only at night.
 """
 from __future__ import annotations
 
@@ -31,13 +35,21 @@ from .const import (
     CONF_LEARNING_ENABLED,
     CONF_MORNING_OFFSET, CONF_DAY_OFFSET, CONF_EVENING_OFFSET, CONF_NIGHT_OFFSET,
     CONF_FAN_CLOSE_DELTA, CONF_FAN_MID_DELTA,
+    CONF_ALLOW_COOL, CONF_ALLOW_HEAT, CONF_ALLOW_FAN_ONLY,
+    CONF_MAX_FAN_MODE, CONF_SEASON_MODE,
+    CONF_SUMMER_HEAT_MIN_TEMP, CONF_SUMMER_HEAT_NIGHT_ONLY,
     DEFAULT_TARGET_TEMP, DEFAULT_TOLERANCE, DEFAULT_MIN_TEMP, DEFAULT_MAX_TEMP,
     DEFAULT_POLL_INTERVAL, DEFAULT_MODE_SWITCH_MIN, DEFAULT_OVERRIDE_TIMEOUT,
     DEFAULT_LEARNING_ENABLED,
     DEFAULT_MORNING_OFFSET, DEFAULT_DAY_OFFSET, DEFAULT_EVENING_OFFSET, DEFAULT_NIGHT_OFFSET,
     DEFAULT_FAN_CLOSE_DELTA, DEFAULT_FAN_MID_DELTA,
+    DEFAULT_ALLOW_COOL, DEFAULT_ALLOW_HEAT, DEFAULT_ALLOW_FAN_ONLY,
+    DEFAULT_MAX_FAN_MODE, DEFAULT_SEASON_MODE,
+    DEFAULT_SUMMER_HEAT_MIN_TEMP, DEFAULT_SUMMER_HEAT_NIGHT_ONLY,
     FAN_RATE_AUTO, FAN_RATE_LOW, FAN_RATE_MEDIUM, FAN_RATE_HIGH,
+    FAN_CAP_AUTO, FAN_CAP_LOW, FAN_CAP_MEDIUM, FAN_CAP_HIGH,
     MODE_COOL, MODE_HEAT, MODE_FAN,
+    SEASON_SUMMER,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -109,7 +121,7 @@ class SmartTemperatureController:
         """Called by __init__.py update listener when options are saved."""
         self.current_target_f = self._target_temp_f()
         _LOGGER.debug(
-            "Options reloaded \u2014 new target=%.1f\u00b0F, max=%.1f\u00b0F",
+            "Options reloaded — new target=%.1f°F, max=%.1f°F",
             self.current_target_f,
             self._opt(CONF_MAX_TEMP, DEFAULT_MAX_TEMP),
         )
@@ -143,25 +155,82 @@ class SmartTemperatureController:
                 return self._opt(key, 0.0)
         return 0.0
 
-    # ------------------------------------------------------------------ logic
+    def _is_night_slot(self) -> bool:
+        now = datetime.now().time()
+        return now >= dtime(22, 0) or now < dtime(6, 0)
+
+    # ------------------------------------------------------------------ mode / fan logic
+
+    def _heat_allowed_now(self, htemp_f: float) -> bool:
+        """Decide whether heating is permitted right now.
+
+        In summer season mode, heating only kicks in once the house has
+        actually dropped to/below summer_heat_min_temp, and (optionally)
+        only during the night slot — so the heater never runs during a
+        summer afternoon just because of a brief dip.
+        """
+        if not self._opt(CONF_ALLOW_HEAT, DEFAULT_ALLOW_HEAT):
+            return False
+
+        season_mode = self._opt(CONF_SEASON_MODE, DEFAULT_SEASON_MODE)
+        if season_mode != SEASON_SUMMER:
+            return True
+
+        summer_min = self._opt(CONF_SUMMER_HEAT_MIN_TEMP, DEFAULT_SUMMER_HEAT_MIN_TEMP)
+        if htemp_f > summer_min:
+            return False
+
+        if self._opt(CONF_SUMMER_HEAT_NIGHT_ONLY, DEFAULT_SUMMER_HEAT_NIGHT_ONLY):
+            return self._is_night_slot()
+
+        return True
+
+    def _cap_fan_rate(self, desired_rate: str) -> str:
+        """Clamp the desired fan rate to the user's max_fan_mode setting."""
+        cap = self._opt(CONF_MAX_FAN_MODE, DEFAULT_MAX_FAN_MODE)
+
+        if cap == FAN_CAP_AUTO:
+            return FAN_RATE_AUTO
+        if cap == FAN_CAP_LOW:
+            return FAN_RATE_LOW if desired_rate != FAN_RATE_AUTO else FAN_RATE_AUTO
+        if cap == FAN_CAP_MEDIUM:
+            if desired_rate == FAN_RATE_HIGH:
+                return FAN_RATE_MEDIUM
+            return desired_rate
+        return desired_rate
 
     def _determine_mode(self, htemp_f: float, target_f: float) -> str:
         delta = htemp_f - target_f
         tol   = self._opt(CONF_TOLERANCE, DEFAULT_TOLERANCE)
+
+        allow_cool = self._opt(CONF_ALLOW_COOL, DEFAULT_ALLOW_COOL)
+
         if abs(delta) <= tol:
             return MODE_FAN
-        return MODE_COOL if delta > 0 else MODE_HEAT
+
+        if delta > tol:
+            return MODE_COOL if allow_cool else MODE_FAN
+
+        # delta < -tol -> house is colder than target
+        if self._heat_allowed_now(htemp_f):
+            return MODE_HEAT
+
+        return MODE_FAN
 
     def _determine_fan(self, htemp_f: float, target_f: float) -> str:
         delta = abs(htemp_f - target_f)
         tol   = self._opt(CONF_TOLERANCE, DEFAULT_TOLERANCE)
+
         if delta <= tol:
-            return FAN_RATE_AUTO
-        if delta <= self._opt(CONF_FAN_CLOSE_DELTA, DEFAULT_FAN_CLOSE_DELTA):
-            return FAN_RATE_LOW
-        if delta <= self._opt(CONF_FAN_MID_DELTA, DEFAULT_FAN_MID_DELTA):
-            return FAN_RATE_MEDIUM
-        return FAN_RATE_HIGH
+            desired = FAN_RATE_AUTO
+        elif delta <= self._opt(CONF_FAN_CLOSE_DELTA, DEFAULT_FAN_CLOSE_DELTA):
+            desired = FAN_RATE_LOW
+        elif delta <= self._opt(CONF_FAN_MID_DELTA, DEFAULT_FAN_MID_DELTA):
+            desired = FAN_RATE_MEDIUM
+        else:
+            desired = FAN_RATE_HIGH
+
+        return self._cap_fan_rate(desired)
 
     def _detect_manual_override(self, current_mode: str, current_fan: str, current_stemp_c: float) -> bool:
         if self._last_commanded_mode is None:
@@ -191,9 +260,8 @@ class SmartTemperatureController:
                 _LOGGER.info("SmartTemperatureController loop cancelled")
                 return
             except Exception:  # noqa: BLE001
-                _LOGGER.exception("Unexpected error in smart temp loop \u2014 will retry next poll")
+                _LOGGER.exception("Unexpected error in smart temp loop — will retry next poll")
 
-            # Sleep AFTER the cycle so boot is never delayed
             poll = self._opt(CONF_POLL_INTERVAL, DEFAULT_POLL_INTERVAL)
             await asyncio.sleep(poll)
 
@@ -208,24 +276,33 @@ class SmartTemperatureController:
 
         d = self.coordinator.data
         if not d.power:
-            _LOGGER.debug("AC is off \u2014 skipping control cycle")
+            _LOGGER.debug("AC is off — skipping control cycle")
             return
 
         htemp_c = d.indoor_temp
         if htemp_c == 0.0:
-            _LOGGER.warning("htemp is 0 \u2014 sensor not ready, skipping")
+            _LOGGER.warning("htemp is 0 — sensor not ready, skipping")
             return
 
         htemp_f  = _c_to_f(htemp_c)
         target_f = self._target_temp_f()
         self.current_target_f = target_f
 
+        _LOGGER.debug(
+            "season=%s allow_cool=%s allow_heat=%s allow_fan_only=%s max_fan=%s",
+            self._opt(CONF_SEASON_MODE, DEFAULT_SEASON_MODE),
+            self._opt(CONF_ALLOW_COOL, DEFAULT_ALLOW_COOL),
+            self._opt(CONF_ALLOW_HEAT, DEFAULT_ALLOW_HEAT),
+            self._opt(CONF_ALLOW_FAN_ONLY, DEFAULT_ALLOW_FAN_ONLY),
+            self._opt(CONF_MAX_FAN_MODE, DEFAULT_MAX_FAN_MODE),
+        )
+
         override_timeout = self._opt(CONF_OVERRIDE_TIMEOUT, DEFAULT_OVERRIDE_TIMEOUT)
         if override_timeout > 0 and self._detect_manual_override(
             str(d.mode), d.fan_rate, d.target_temp
         ):
             self._override_until = time.monotonic() + override_timeout
-            _LOGGER.info("Manual override detected \u2014 pausing for %ds", override_timeout)
+            _LOGGER.info("Manual override detected — pausing for %ds", override_timeout)
 
         if time.monotonic() < self._override_until:
             _LOGGER.debug("Override active (%.0fs remaining)", self._override_until - time.monotonic())
@@ -239,7 +316,7 @@ class SmartTemperatureController:
         stemp_str = str(stemp_c)
 
         _LOGGER.info(
-            "htemp=%.1f\u00b0F | target=%.1f\u00b0F | delta=%+.1f\u00b0F | mode=%s | fan=%s",
+            "htemp=%.1f°F | target=%.1f°F | delta=%+.1f°F | mode=%s | fan=%s",
             htemp_f, target_f, htemp_f - target_f, mode, fan,
         )
 
@@ -252,7 +329,7 @@ class SmartTemperatureController:
             and abs(current_stemp_c - stemp_c) < 0.25
         )
         if already_ok:
-            _LOGGER.debug("AC already at desired state \u2014 no command needed")
+            _LOGGER.debug("AC already at desired state — no command needed")
             self.last_mode = mode
             return
 
@@ -262,7 +339,7 @@ class SmartTemperatureController:
             CONF_MODE_SWITCH_MIN, DEFAULT_MODE_SWITCH_MIN
         ):
             _LOGGER.debug(
-                "Mode switch to %s suppressed \u2014 %.0fs since last switch",
+                "Mode switch to %s suppressed — %.0fs since last switch",
                 mode, now - self._last_mode_switch_at,
             )
             return
@@ -292,4 +369,4 @@ class SmartTemperatureController:
         if mode_changed:
             self._last_mode_switch_at = now
         self.last_mode = mode
-        _LOGGER.info("Command sent \u2014 mode=%s fan=%s stemp=%.1f\u00b0C", mode, fan, stemp_c)
+        _LOGGER.info("Command sent — mode=%s fan=%s stemp=%.1f°C", mode, fan, stemp_c)
