@@ -1,0 +1,42 @@
+# Smart Learning House - Configuration
+
+mqtt:
+  broker: "192.168.1.10"        # Your MQTT broker IP
+  port: 1883
+  username: "mqtt_user"
+  password: "mqtt_pass"
+  topic_prefix: "home/sensors"  # Sensors publish to home/sensors/<room>/temperature
+
+daikin:
+  ip: "192.168.1.50"            # Daikin unit local IP
+  port: 80
+
+comfort:
+  target_temp: 72               # Target temp in Fahrenheit (or Celsius if use_celsius: true)
+  use_celsius: false
+  tolerance: 1.5                # +/- tolerance band before triggering AC change (degrees)
+  min_temp: 65                  # Absolute floor — never let house drop below this
+  max_temp: 80                  # Absolute ceiling — never let house exceed this
+
+fan_speed:
+  # Fan speed levels: 1=auto, 2=low, 3=medium, 4=high, 5=night (quiet)
+  low_delta: 1        # Use low fan when within 2°F of target
+  medium_delta: 3     # Use medium fan when within 3°F
+  high_delta: 99      # Use high fan beyond that
+
+learning:
+  enabled: true
+  history_days: 30              # Days of history to use for learning adjustments
+  time_slots:                   # Time-based comfort offsets (degrees from target_temp)
+    morning:   { start: "06:00", end: "09:00", offset: -1 }   # Slightly cooler morning
+    day:       { start: "09:00", end: "17:00", offset: 0 }
+    evening:   { start: "17:00", end: "22:00", offset: 1 }    # Slightly warmer evening
+    night:     { start: "22:00", end: "06:00", offset: -2 }   # Cooler for sleep
+
+logging:
+  db_path: "data/sensor_log.db"
+  level: "INFO"
+
+control:
+  poll_interval: 30             # Seconds between control loop evaluations
+  min_mode_switch_interval: 300 # Minimum seconds between mode changes (avoid rapid cycling)
