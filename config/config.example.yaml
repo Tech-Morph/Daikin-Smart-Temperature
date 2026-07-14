@@ -1,42 +1,41 @@
-# Smart Learning House - Configuration
-
-mqtt:
-  broker: "192.168.1.10"        # Your MQTT broker IP
-  port: 1883
-  username: "mqtt_user"
-  password: "mqtt_pass"
-  topic_prefix: "home/sensors"  # Sensors publish to home/sensors/<room>/temperature
+# Smart Learning House — Configuration
+# Cloud-only mode: uses Daikin Comfort Control API (scr.daikincloud.net)
 
 daikin:
-  ip: "192.168.1.50"            # Daikin unit local IP
-  port: 80
+  username: "your@email.com"
+  password: "yourpassword"
+  uid: "your-x-daikin-uid-string"    # Static device fingerprint from app traffic
+  # device_id is auto-discovered from /common/device_list on startup
 
 comfort:
-  target_temp: 72               # Target temp in Fahrenheit (or Celsius if use_celsius: true)
-  use_celsius: false
-  tolerance: 1.5                # +/- tolerance band before triggering AC change (degrees)
-  min_temp: 65                  # Absolute floor — never let house drop below this
-  max_temp: 80                  # Absolute ceiling — never let house exceed this
+  target_temp_c: 21.0        # Target indoor temp in Celsius (matches Daikin API)
+  tolerance_c: 0.8           # +/- band before issuing a control change
+  min_temp_c: 18.0           # Absolute floor
+  max_temp_c: 28.0           # Absolute ceiling
 
 fan_speed:
-  # Fan speed levels: 1=auto, 2=low, 3=medium, 4=high, 5=night (quiet)
-  low_delta: 1        # Use low fan when within 2°F of target
-  medium_delta: 3     # Use medium fan when within 3°F
-  high_delta: 99      # Use high fan beyond that
+  # Daikin f_rate values: A=auto, 3=low, 4=medium-low, 5=medium-high, 6=high, B=night
+  within_tolerance: "A"      # Auto fan when within comfort band
+  close_range_c: 1.5         # degrees from target -> low fan
+  close_fan: "3"
+  mid_range_c: 3.0           # degrees from target -> medium fan
+  mid_fan: "5"
+  far_fan: "6"               # Beyond mid_range -> high fan
 
 learning:
   enabled: true
-  history_days: 30              # Days of history to use for learning adjustments
-  time_slots:                   # Time-based comfort offsets (degrees from target_temp)
-    morning:   { start: "06:00", end: "09:00", offset: -1 }   # Slightly cooler morning
-    day:       { start: "09:00", end: "17:00", offset: 0 }
-    evening:   { start: "17:00", end: "22:00", offset: 1 }    # Slightly warmer evening
-    night:     { start: "22:00", end: "06:00", offset: -2 }   # Cooler for sleep
+  time_slots:
+    # Offsets are in Celsius, applied to target_temp_c
+    morning:  { start: "06:00", end: "09:00", offset:  0.0 }
+    day:      { start: "09:00", end: "17:00", offset:  0.5 }  # Slightly warmer during day
+    evening:  { start: "17:00", end: "22:00", offset:  0.5 }
+    night:    { start: "22:00", end: "06:00", offset: -1.0 }  # Cooler for sleep
+
+control:
+  poll_interval_s: 60          # Seconds between sensor reads (Daikin cloud rate-limit friendly)
+  command_cooldown_s: 20       # Mirrors coordinator.py: skip poll for 20s after command
+  min_mode_switch_interval_s: 300  # Prevent compressor short-cycling
 
 logging:
   db_path: "data/sensor_log.db"
   level: "INFO"
-
-control:
-  poll_interval: 30             # Seconds between control loop evaluations
-  min_mode_switch_interval: 300 # Minimum seconds between mode changes (avoid rapid cycling)

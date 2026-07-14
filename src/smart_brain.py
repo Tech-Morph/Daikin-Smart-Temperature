@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
-Smart Learning House - Main Control Brain
-Monitors temperature via MQTT and controls Daikin AC/heater.
+Smart Learning House — Main Control Brain
+
+Uses the Daikin Comfort Control cloud API (same stack as daikin_comfort_control
+custom component) to read htemp and issue control commands.
+
+No MQTT. No ESPHome. No local network access required.
 """
+from __future__ import annotations
 
 import asyncio
 import logging
@@ -10,147 +15,146 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import aiohttp
 import yaml
-import paho.mqtt.client as mqtt
 
-from daikin_controller import DaikinController
+from daikin_client import DaikinClient
 from learning_engine import LearningEngine
 from sensor_db import SensorDB
 
-# ---------------------------------------------------------------------------
-# Config loader
-# ---------------------------------------------------------------------------
+_LOGGER = logging.getLogger("SmartBrain")
+
 
 def load_config(path: str = "config/config.yaml") -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
 
 
-# ---------------------------------------------------------------------------
-# SmartBrain
-# ---------------------------------------------------------------------------
-
 class SmartBrain:
-    def __init__(self, config: dict):
-        self.cfg = config
-        self.logger = logging.getLogger("SmartBrain")
-        self.current_temps: dict[str, float] = {}  # room -> temp
-        self.last_mode_switch = 0.0
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.db = SensorDB(cfg["logging"]["db_path"])
+        self.learning = LearningEngine(cfg)
+        self._last_command_at: float = 0.0
+        self._last_mode_switch_at: float = 0.0
+        self._last_mode: str | None = None
 
-        self.daikin = DaikinController(
-            ip=config["daikin"]["ip"],
-            port=config["daikin"].get("port", 80),
-        )
-        self.db = SensorDB(config["logging"]["db_path"])
-        self.learning = LearningEngine(config, self.db)
+    def _determine_mode(self, htemp: float, target: float) -> str:
+        """cool | heat | fan based on delta vs tolerance band."""
+        delta = htemp - target
+        tol = self.cfg["comfort"]["tolerance_c"]
+        if abs(delta) <= tol:
+            return "fan"
+        return "cool" if delta > 0 else "heat"
 
-        # MQTT setup
-        self.mqtt_client = mqtt.Client()
-        self.mqtt_client.username_pw_set(
-            config["mqtt"]["username"],
-            config["mqtt"]["password"],
-        )
-        self.mqtt_client.on_connect = self._on_mqtt_connect
-        self.mqtt_client.on_message = self._on_mqtt_message
+    def _determine_fan(self, htemp: float, target: float) -> str:
+        fc = self.cfg["fan_speed"]
+        delta = abs(htemp - target)
+        tol = self.cfg["comfort"]["tolerance_c"]
+        if delta <= tol:
+            return fc["within_tolerance"]
+        if delta <= fc["close_range_c"]:
+            return fc["close_fan"]
+        if delta <= fc["mid_range_c"]:
+            return fc["mid_fan"]
+        return fc["far_fan"]
 
-    def _on_mqtt_connect(self, client, userdata, flags, rc):
-        if rc == 0:
-            topic = f"{self.cfg['mqtt']['topic_prefix']}/#"
-            client.subscribe(topic)
-            self.logger.info(f"MQTT connected. Subscribed to {topic}")
-        else:
-            self.logger.error(f"MQTT connection failed: rc={rc}")
+    # Daikin mode string -> API mode int
+    MODE_MAP = {"cool": "3", "heat": "4", "fan": "6", "auto": "1", "dry": "2"}
 
-    def _on_mqtt_message(self, client, userdata, msg):
-        try:
-            # Expected topic: home/sensors/<room>/temperature
-            parts = msg.topic.split("/")
-            if len(parts) >= 3 and parts[-1] == "temperature":
-                room = parts[-2]
-                temp = float(msg.payload.decode())
-                use_celsius = self.cfg["comfort"].get("use_celsius", False)
-                if use_celsius:
-                    temp = (temp * 9 / 5) + 32  # Normalize to Fahrenheit internally
-                self.current_temps[room] = temp
-                self.db.log_temperature(room, temp)
-                self.logger.debug(f"Sensor [{room}]: {temp:.1f}°F")
-        except Exception as e:
-            self.logger.error(f"Error parsing MQTT message: {e}")
-
-    def _average_temp(self) -> float | None:
-        if not self.current_temps:
-            return None
-        return sum(self.current_temps.values()) / len(self.current_temps)
-
-    def _determine_fan_speed(self, delta: float) -> str:
-        fan_cfg = self.cfg["fan_speed"]
-        abs_delta = abs(delta)
-        if abs_delta <= fan_cfg["low_delta"]:
-            return "1"   # Auto/quiet
-        elif abs_delta <= fan_cfg["medium_delta"]:
-            return "3"   # Medium
-        else:
-            return "4"   # High
-
-    def _determine_mode(self, avg_temp: float, target: float) -> str:
-        """Returns Daikin mode: cool, heat, fan, auto"""
-        delta = avg_temp - target
-        tolerance = self.cfg["comfort"]["tolerance"]
-        if abs(delta) <= tolerance:
-            return "fan"   # Within tolerance — just circulate
-        elif delta > 0:
-            return "cool"  # Too hot
-        else:
-            return "heat"  # Too cold
-
-    async def control_loop(self):
-        poll = self.cfg["control"]["poll_interval"]
-        min_switch = self.cfg["control"]["min_mode_switch_interval"]
+    async def control_loop(self, client: DaikinClient):
+        poll = self.cfg["control"]["poll_interval_s"]
+        cooldown = self.cfg["control"]["command_cooldown_s"]
+        mode_switch_min = self.cfg["control"]["min_mode_switch_interval_s"]
 
         while True:
             await asyncio.sleep(poll)
-            avg = self._average_temp()
-            if avg is None:
-                self.logger.warning("No sensor data yet — skipping control cycle")
+
+            # Skip read if we just sent a command (cloud propagation lag)
+            since_cmd = time.monotonic() - self._last_command_at
+            if self._last_command_at and since_cmd < cooldown:
+                _LOGGER.debug("Within command cooldown (%.1fs left) — skipping poll", cooldown - since_cmd)
                 continue
 
-            target = self.learning.get_current_target()
-            delta = avg - target
-            mode = self._determine_mode(avg, target)
-            fan = self._determine_fan_speed(delta)
+            try:
+                state = await client.get_state()
+            except Exception as e:
+                _LOGGER.error("Failed to read device state: %s", e)
+                continue
 
-            self.logger.info(
-                f"Avg temp: {avg:.1f}°F | Target: {target:.1f}°F | "
-                f"Delta: {delta:+.1f}°F | Mode: {mode} | Fan: {fan}"
+            htemp = state["htemp"]
+            target = self.learning.get_current_target()
+            mode_str = self._determine_mode(htemp, target)
+            fan = self._determine_fan(htemp, target)
+            mode_code = self.MODE_MAP[mode_str]
+
+            _LOGGER.info(
+                "htemp=%.1f°C | target=%.1f°C | delta=%+.1f | mode=%s | fan=%s",
+                htemp, target, htemp - target, mode_str, fan,
             )
 
-            # Rate-limit mode switches to prevent rapid cycling
-            now = time.time()
-            if (now - self.last_mode_switch) >= min_switch:
-                try:
-                    await self.daikin.set_control(mode=mode, fan=fan, setpoint=target)
-                    self.last_mode_switch = now
-                    self.db.log_control_action(avg, target, mode, fan)
-                except Exception as e:
-                    self.logger.error(f"Daikin control error: {e}")
-            else:
-                self.logger.debug("Mode switch rate-limited — skipping")
+            self.db.log_temperature(htemp, target, state.get("otemp", 0.0))
 
-    def run(self):
+            # Rate-limit mode switches (protect compressor)
+            now = time.monotonic()
+            mode_changed = mode_str != self._last_mode
+            time_since_switch = now - self._last_mode_switch_at
+
+            if mode_changed and time_since_switch < mode_switch_min:
+                _LOGGER.debug(
+                    "Mode switch to '%s' suppressed — %.0fs since last switch (min %ds)",
+                    mode_str, time_since_switch, mode_switch_min,
+                )
+                continue
+
+            # Always skip command if already in desired state within tolerance
+            current_mode = str(state.get("mode", ""))
+            current_fan = str(state.get("f_rate", ""))
+            current_stemp = float(state.get("stemp", 0.0))
+            desired_stemp = round(target, 1)
+
+            already_correct = (
+                current_mode == mode_code
+                and current_fan == fan
+                and abs(current_stemp - desired_stemp) < 0.1
+            )
+            if already_correct:
+                _LOGGER.debug("AC already at desired state — no command needed")
+                continue
+
+            try:
+                await client.set_control(
+                    mode=mode_code,
+                    fan=fan,
+                    stemp=desired_stemp,
+                )
+                self._last_command_at = time.monotonic()
+                if mode_changed:
+                    self._last_mode_switch_at = now
+                    self._last_mode = mode_str
+                self.db.log_control_action(htemp, target, mode_str, fan)
+                _LOGGER.info("Command sent OK")
+            except Exception as e:
+                _LOGGER.error("Failed to set control: %s", e)
+
+    async def run(self):
         logging.basicConfig(
             level=self.cfg["logging"].get("level", "INFO"),
             format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
         )
-        self.mqtt_client.connect(
-            self.cfg["mqtt"]["broker"],
-            self.cfg["mqtt"]["port"],
-        )
-        self.mqtt_client.loop_start()
-        self.logger.info("Smart Learning House brain started")
-        asyncio.run(self.control_loop())
+        async with aiohttp.ClientSession() as session:
+            client = DaikinClient(
+                username=self.cfg["daikin"]["username"],
+                password=self.cfg["daikin"]["password"],
+                uid=self.cfg["daikin"]["uid"],
+                session=session,
+            )
+            await client.connect()
+            _LOGGER.info("Smart Learning House started. Device: %s", client.device_id)
+            await self.control_loop(client)
 
 
 if __name__ == "__main__":
     cfg = load_config()
     brain = SmartBrain(cfg)
-    brain.run()
+    asyncio.run(brain.run())

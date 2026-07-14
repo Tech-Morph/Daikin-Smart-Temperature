@@ -12,7 +12,6 @@ services:
       - ../data:/app/data
     environment:
       - TZ=America/Los_Angeles
-    network_mode: host   # Needed for Daikin LAN API access
     logging:
       driver: json-file
       options:

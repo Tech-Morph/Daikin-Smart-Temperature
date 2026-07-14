@@ -1,54 +1,7 @@
-# ESPHome config for ESP32 temperature sensor node
-# Publishes temperature to MQTT: home/sensors/<room>/temperature
-
-substitutions:
-  device_name: "temp-sensor-living-room"
-  room_name: "living_room"
-  friendly_name: "Living Room Temp Sensor"
-
-esphome:
-  name: ${device_name}
-  friendly_name: ${friendly_name}
-
-esp32:
-  board: esp32dev
-  framework:
-    type: arduino
-
-wifi:
-  ssid: !secret wifi_ssid
-  password: !secret wifi_password
-  ap:
-    ssid: "${device_name}-fallback"
-    password: "fallback123"
-
-mqtt:
-  broker: !secret mqtt_broker
-  username: !secret mqtt_username
-  password: !secret mqtt_password
-  topic_prefix: home/sensors/${room_name}
-
-sensor:
-  - platform: dht
-    pin: GPIO4
-    model: DHT22
-    temperature:
-      name: "${friendly_name} Temperature"
-      unit_of_measurement: "°F"
-      filters:
-        - offset: 0.0        # Calibration offset if needed
-        - sliding_window_moving_average:
-            window_size: 5
-            send_every: 5
-      on_value:
-        mqtt.publish:
-          topic: home/sensors/${room_name}/temperature
-          payload: !lambda 'return str_sprintf("%.2f", x);'
-    humidity:
-      name: "${friendly_name} Humidity"
-    update_interval: 30s
-
-logger:
-api:
-ota:
-  password: !secret ota_password
+# NOT REQUIRED for cloud-only mode.
+# The Daikin AC's built-in indoor sensor (htemp) is used instead.
+# This file is kept as a reference in case you later want to add
+# a separate room-center sensor and average it with htemp.
+#
+# If you do add a room sensor, expose it via MQTT and average
+# the two readings in smart_brain.py before passing to LearningEngine.

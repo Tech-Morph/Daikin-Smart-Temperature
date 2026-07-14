@@ -1,50 +1,60 @@
 # 🏠 Smart Learning House
 
-An AI-driven temperature management system that monitors your home's temperature via MQTT sensors and autonomously controls your **Daikin AC/Heater** — adjusting mode, fan speed, and setpoint to maintain comfort while learning your preferences over time.
+An autonomous temperature management system that reads your home's temperature
+directly from the **Daikin AC's built-in indoor sensor** (`htemp`) and
+controls the unit via the **Daikin Comfort Control cloud API** — the same
+cloud stack reverse-engineered in [daikin_comfort_control](https://github.com/Tech-Morph/daikin_comfort_control).
 
-## Features
+No extra sensors, no MQTT broker, no ESPHome required.
 
-- 📡 Real-time temperature monitoring via MQTT (ESP32/ESPHome sensors)
-- 🧠 Learning controller that adapts setpoint targets based on time-of-day and history
-- 🌀 Daikin LAN API integration — controls mode (cool/heat/fan/auto), fan speed, and target temp
-- 📊 SQLite logging for historical analysis and model training
-- ⚙️ YAML-based configuration (no hardcoded secrets)
-- 🐳 Docker Compose ready
-
-## Architecture
+## How It Works
 
 ```
-[ESP32 Sensors] → MQTT Broker → [smart-brain.py] → Daikin LAN API
-                                       ↓
-                               SQLite DB (logs)
+[Daikin Cloud API]
+        │
+        ├── GET /aircon/get_sensor_info  →  htemp (indoor °C from AC sensor)
+        ├── GET /aircon/get_control_info  →  current mode, fan, setpoint
+        └── GET /aircon/set_control_info  ←  SmartBrain pushes new params
+                  ↑
+          [SmartBrain]
+            - Reads htemp every 60s
+            - Runs LearningEngine (time-slot target + PID correction)
+            - Determines mode (cool/heat/fan) and fan speed
+            - Rate-limits commands to avoid API hammering
+            - Logs everything to SQLite
 ```
+
+## Key Design Decisions
+
+- **`htemp` as the sole sensor** — the AC unit's indoor thermistor. Not room-center accurate, but good enough for setpoint-based control. Works with zero extra hardware.
+- **Cloud API reuse** — uses the same auth + endpoint logic from `daikin_comfort_control/daikin_api.py`. No duplication; the `daikin_api.py` file is symlinked/copied in.
+- **No Home Assistant dependency** — runs standalone as a Docker container or Python process.
+- **20s command cooldown** — mirrors coordinator logic; skips polling immediately after issuing a command to avoid reading stale cloud state.
 
 ## Quick Start
 
-### 1. Configure
 ```bash
+git clone https://github.com/Tech-Morph/smart-learning-house
+cd smart-learning-house
 cp config/config.example.yaml config/config.yaml
-# Edit config/config.yaml with your MQTT broker, Daikin IP, and comfort settings
+# Fill in your Daikin username, password, uid
+nano config/config.yaml
+
+docker compose -f docker/docker-compose.yml up -d
 ```
 
-### 2. Run with Docker
+## Config
+
+See `config/config.example.yaml`. The `daikin.uid` value is the `x-daikin-uid`
+header — a static device fingerprint string captured from the app.
+
+## Logs
+
 ```bash
-docker compose up -d
+docker logs -f smart-learning-house
+# or view SQLite:
+sqlite3 data/sensor_log.db 'SELECT * FROM temperature_log ORDER BY ts DESC LIMIT 20;'
 ```
-
-### 3. Run Directly (Python)
-```bash
-pip install -r requirements.txt
-python src/smart_brain.py
-```
-
-## Sensor Setup (ESPHome)
-
-See `esphome/temperature_sensor.yaml` for a ready-to-flash ESP32 config that publishes temperature to MQTT.
-
-## Config Reference
-
-See `config/config.example.yaml` for all options.
 
 ## License
 
