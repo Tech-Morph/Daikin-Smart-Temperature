@@ -1,7 +1,0 @@
-# NOT REQUIRED for cloud-only mode.
-# The Daikin AC's built-in indoor sensor (htemp) is used instead.
-# This file is kept as a reference in case you later want to add
-# a separate room-center sensor and average it with htemp.
-#
-# If you do add a room sensor, expose it via MQTT and average
-# the two readings in smart_brain.py before passing to LearningEngine.
