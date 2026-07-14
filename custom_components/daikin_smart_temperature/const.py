@@ -1,54 +1,72 @@
 """Constants for Daikin Smart Temperature."""
 
-DOMAIN        = "daikin_smart_temperature"
-DAIKIN_DOMAIN = "daikin_comfort_control"   # Sister integration domain
+DOMAIN = "daikin_smart_temperature"
+DAIKIN_DOMAIN = "daikin_comfort_control"
 
-# Config / options keys
-CONF_DEVICE_ID           = "device_id"
-CONF_TARGET_TEMP         = "target_temp"          # °F
-CONF_TOLERANCE           = "tolerance"             # °F
-CONF_MIN_TEMP            = "min_temp"              # °F
-CONF_MAX_TEMP            = "max_temp"              # °F
-CONF_POLL_INTERVAL       = "poll_interval"         # seconds
-CONF_MODE_SWITCH_MIN     = "mode_switch_min"       # seconds
-CONF_OVERRIDE_TIMEOUT    = "override_timeout"      # seconds (0 = disabled)
-CONF_LEARNING_ENABLED    = "learning_enabled"
+CONF_DEVICE_ID = "device_id"
+CONF_TARGET_TEMP = "target_temp"
+CONF_TOLERANCE = "tolerance"
+CONF_MIN_TEMP = "min_temp"
+CONF_MAX_TEMP = "max_temp"
+CONF_POLL_INTERVAL = "poll_interval"
+CONF_MODE_SWITCH_MIN = "mode_switch_min"
+CONF_OVERRIDE_TIMEOUT = "override_timeout"
+CONF_LEARNING_ENABLED = "learning_enabled"
 
-# Time-slot option keys
-CONF_MORNING_OFFSET  = "morning_offset"
-CONF_DAY_OFFSET      = "day_offset"
-CONF_EVENING_OFFSET  = "evening_offset"
-CONF_NIGHT_OFFSET    = "night_offset"
+CONF_MORNING_OFFSET = "morning_offset"
+CONF_DAY_OFFSET = "day_offset"
+CONF_EVENING_OFFSET = "evening_offset"
+CONF_NIGHT_OFFSET = "night_offset"
 
-# Fan threshold option keys
-CONF_FAN_CLOSE_DELTA = "fan_close_delta"   # within this °F of target -> low fan
-CONF_FAN_MID_DELTA   = "fan_mid_delta"     # within this °F -> medium fan
+CONF_FAN_CLOSE_DELTA = "fan_close_delta"
+CONF_FAN_MID_DELTA = "fan_mid_delta"
 
-# Daikin fan rate codes (from daikin_comfort_control/const.py)
-FAN_RATE_AUTO   = "A"
-FAN_RATE_LOW    = "2"
+CONF_ALLOW_COOL = "allow_cool"
+CONF_ALLOW_HEAT = "allow_heat"
+CONF_ALLOW_FAN_ONLY = "allow_fan_only"
+CONF_MAX_FAN_MODE = "max_fan_mode"
+CONF_SEASON_MODE = "season_mode"
+CONF_SUMMER_HEAT_MIN_TEMP = "summer_heat_min_temp"
+CONF_SUMMER_HEAT_NIGHT_ONLY = "summer_heat_night_only"
+
+FAN_RATE_AUTO = "A"
+FAN_RATE_LOW = "2"
 FAN_RATE_MEDIUM = "3"
-FAN_RATE_HIGH   = "4"
+FAN_RATE_HIGH = "4"
 
-# Daikin mode codes
 MODE_COOL = "3"
 MODE_HEAT = "4"
-MODE_FAN  = "6"
+MODE_FAN = "6"
 
-# Defaults
-DEFAULT_TARGET_TEMP      = 72.0
-DEFAULT_TOLERANCE        = 2.0
-DEFAULT_MIN_TEMP         = 65.0
-DEFAULT_MAX_TEMP         = 85.0
-DEFAULT_POLL_INTERVAL    = 60
-DEFAULT_MODE_SWITCH_MIN  = 300
-DEFAULT_OVERRIDE_TIMEOUT = 1800   # 30 min
+FAN_CAP_AUTO = "auto"
+FAN_CAP_LOW = "low"
+FAN_CAP_MEDIUM = "medium"
+FAN_CAP_HIGH = "high"
+
+SEASON_NORMAL = "normal"
+SEASON_SUMMER = "summer"
+
+DEFAULT_TARGET_TEMP = 72.0
+DEFAULT_TOLERANCE = 2.0
+DEFAULT_MIN_TEMP = 65.0
+DEFAULT_MAX_TEMP = 85.0
+DEFAULT_POLL_INTERVAL = 60
+DEFAULT_MODE_SWITCH_MIN = 300
+DEFAULT_OVERRIDE_TIMEOUT = 1800
 DEFAULT_LEARNING_ENABLED = True
 
-DEFAULT_MORNING_OFFSET  =  0.0
-DEFAULT_DAY_OFFSET      =  1.0
-DEFAULT_EVENING_OFFSET  =  1.0
-DEFAULT_NIGHT_OFFSET    = -2.0
+DEFAULT_MORNING_OFFSET = 0.0
+DEFAULT_DAY_OFFSET = 1.0
+DEFAULT_EVENING_OFFSET = 1.0
+DEFAULT_NIGHT_OFFSET = -2.0
 
-DEFAULT_FAN_CLOSE_DELTA =  2.0
-DEFAULT_FAN_MID_DELTA   =  4.0
+DEFAULT_FAN_CLOSE_DELTA = 2.0
+DEFAULT_FAN_MID_DELTA = 4.0
+
+DEFAULT_ALLOW_COOL = True
+DEFAULT_ALLOW_HEAT = True
+DEFAULT_ALLOW_FAN_ONLY = True
+DEFAULT_MAX_FAN_MODE = FAN_CAP_HIGH
+DEFAULT_SEASON_MODE = SEASON_SUMMER
+DEFAULT_SUMMER_HEAT_MIN_TEMP = 60.0
+DEFAULT_SUMMER_HEAT_NIGHT_ONLY = True
