@@ -112,7 +112,7 @@ direction and humidity settings from the current coordinator state.
 ## Installation (HACS)
 
 1. HACS → Integrations → ⋮ → **Custom Repositories**
-2. URL: `https://github.com/Tech-Morph/smart-learning-house` · Category: **Integration**
+2. URL: `https://github.com/Tech-Morph/Daikin-Smart-Temperature` · Category: **Integration**
 3. Install **Daikin Comfort Control Smart Temperature** → **Restart HA**
 4. Settings → Devices & Services → **Add Integration** → search `Daikin Smart Temperature`
 5. Select your Daikin device (auto-discovered from `daikin_comfort_control`)
