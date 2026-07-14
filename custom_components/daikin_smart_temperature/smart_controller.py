@@ -1,15 +1,18 @@
 """
 SmartTemperatureController
 
-The core brain. Runs as an async HA task, reads htemp from the
-daikin_comfort_control coordinator (no extra API calls), and issues
+The core brain. Runs as an async HA background task, reads htemp from
+the daikin_comfort_control coordinator (no extra API calls), and issues
 set_control_info commands when the temperature drifts outside the
 comfort band.
 
-Fix note: stores entry_id and always resolves the LIVE ConfigEntry from
-hass.config_entries on every access. This means options saved via the
-UI options flow take effect on the very next poll cycle — no HA restart
-or integration reload required.
+Key design decisions:
+  - Uses hass.async_create_background_task() so HA does NOT track this
+    coroutine as a setup dependency and the bootstrap watchdog never fires.
+  - Sleep is at the END of the loop (not the start), so the very first
+    evaluation runs immediately after HA finishes starting up.
+  - Always resolves the live ConfigEntry via entry_id so options changes
+    take effect on the next poll without a reload.
 """
 from __future__ import annotations
 
@@ -56,7 +59,7 @@ class SmartTemperatureController:
 
     def __init__(self, hass: HomeAssistant, entry_id: str, coordinator) -> None:
         self.hass        = hass
-        self._entry_id   = entry_id   # store ID, not the entry object
+        self._entry_id   = entry_id
         self.coordinator = coordinator
         self._task: asyncio.Task | None = None
         self._enabled: bool = True
@@ -73,14 +76,22 @@ class SmartTemperatureController:
     # ------------------------------------------------------------------ live entry
 
     @property
-    def _entry(self) -> ConfigEntry:
+    def _entry(self) -> ConfigEntry | None:
         """Always return the LIVE entry so options changes are seen immediately."""
         return self.hass.config_entries.async_get_entry(self._entry_id)
 
     # ------------------------------------------------------------------ lifecycle
 
     def start(self) -> None:
-        self._task = self.hass.async_create_task(self._loop(), "daikin_smart_temp_loop")
+        """Start the background loop using async_create_background_task.
+
+        Background tasks are NOT tracked by HA's setup/bootstrap watchdog,
+        so this will never cause a 'Setup timed out' error regardless of
+        how long the loop sleeps.
+        """
+        self._task = self.hass.async_create_background_task(
+            self._loop(), name="daikin_smart_temp_loop"
+        )
 
     def stop(self) -> None:
         if self._task:
@@ -92,14 +103,13 @@ class SmartTemperatureController:
         _LOGGER.info("Smart temperature automation %s", "enabled" if enabled else "disabled")
 
     def register_options_callback(self, cb) -> None:
-        """Entities register here to be notified when options change."""
         self._options_updated_callbacks.append(cb)
 
     def options_updated(self) -> None:
         """Called by __init__.py update listener when options are saved."""
         self.current_target_f = self._target_temp_f()
         _LOGGER.debug(
-            "Options reloaded — new target=%.1f°F, max=%.1f°F",
+            "Options reloaded \u2014 new target=%.1f\u00b0F, max=%.1f\u00b0F",
             self.current_target_f,
             self._opt(CONF_MAX_TEMP, DEFAULT_MAX_TEMP),
         )
@@ -109,7 +119,6 @@ class SmartTemperatureController:
     # ------------------------------------------------------------------ options helpers
 
     def _opt(self, key: str, default: Any) -> Any:
-        """Read from the live entry's options, falling back to default."""
         entry = self._entry
         if entry is None:
             return default
@@ -168,105 +177,119 @@ class SmartTemperatureController:
     # ------------------------------------------------------------------ main loop
 
     async def _loop(self) -> None:
-        _LOGGER.info("SmartTemperatureController loop started for %s", self.coordinator.device_id)
+        """Main control loop. Sleep is at the END so the first cycle runs
+        immediately on startup and never blocks the bootstrap phase."""
+        _LOGGER.info("SmartTemperatureController started for %s", self.coordinator.device_id)
+
+        # Yield once so HA finishes setup before we do any real work
+        await asyncio.sleep(0)
+
         while True:
+            try:
+                await self._run_cycle()
+            except asyncio.CancelledError:
+                _LOGGER.info("SmartTemperatureController loop cancelled")
+                return
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Unexpected error in smart temp loop \u2014 will retry next poll")
+
+            # Sleep AFTER the cycle so boot is never delayed
             poll = self._opt(CONF_POLL_INTERVAL, DEFAULT_POLL_INTERVAL)
             await asyncio.sleep(poll)
 
-            if not self._enabled:
-                continue
+    async def _run_cycle(self) -> None:
+        """Single evaluation cycle. Called every poll_interval seconds."""
+        if not self._enabled:
+            return
 
-            if self.coordinator.data is None:
-                _LOGGER.debug("Coordinator has no data yet, skipping")
-                continue
+        if self.coordinator.data is None:
+            _LOGGER.debug("Coordinator has no data yet, skipping")
+            return
 
-            d = self.coordinator.data
-            if not d.power:
-                _LOGGER.debug("AC is off — skipping control cycle")
-                continue
+        d = self.coordinator.data
+        if not d.power:
+            _LOGGER.debug("AC is off \u2014 skipping control cycle")
+            return
 
-            htemp_c = d.indoor_temp
-            if htemp_c == 0.0:
-                _LOGGER.warning("htemp is 0 — sensor not ready, skipping")
-                continue
+        htemp_c = d.indoor_temp
+        if htemp_c == 0.0:
+            _LOGGER.warning("htemp is 0 \u2014 sensor not ready, skipping")
+            return
 
-            htemp_f  = _c_to_f(htemp_c)
-            target_f = self._target_temp_f()   # reads live options every cycle
-            self.current_target_f = target_f
+        htemp_f  = _c_to_f(htemp_c)
+        target_f = self._target_temp_f()
+        self.current_target_f = target_f
 
-            override_timeout = self._opt(CONF_OVERRIDE_TIMEOUT, DEFAULT_OVERRIDE_TIMEOUT)
-            if override_timeout > 0 and self._detect_manual_override(
-                str(d.mode), d.fan_rate, d.target_temp
-            ):
-                self._override_until = time.monotonic() + override_timeout
-                _LOGGER.info("Manual override detected — pausing automation for %ds", override_timeout)
+        override_timeout = self._opt(CONF_OVERRIDE_TIMEOUT, DEFAULT_OVERRIDE_TIMEOUT)
+        if override_timeout > 0 and self._detect_manual_override(
+            str(d.mode), d.fan_rate, d.target_temp
+        ):
+            self._override_until = time.monotonic() + override_timeout
+            _LOGGER.info("Manual override detected \u2014 pausing for %ds", override_timeout)
 
-            if time.monotonic() < self._override_until:
-                _LOGGER.debug("Override active (%.0fs remaining)", self._override_until - time.monotonic())
-                continue
+        if time.monotonic() < self._override_until:
+            _LOGGER.debug("Override active (%.0fs remaining)", self._override_until - time.monotonic())
+            return
 
-            mode = self._determine_mode(htemp_f, target_f)
-            fan  = self._determine_fan(htemp_f, target_f)
+        mode = self._determine_mode(htemp_f, target_f)
+        fan  = self._determine_fan(htemp_f, target_f)
 
-            target_c  = (target_f - 32) * 5 / 9
-            stemp_c   = round(target_c * 2) / 2
-            stemp_str = str(stemp_c)
+        target_c  = (target_f - 32) * 5 / 9
+        stemp_c   = round(target_c * 2) / 2
+        stemp_str = str(stemp_c)
 
-            _LOGGER.info(
-                "htemp=%.1f°F | target=%.1f°F | delta=%+.1f°F | mode=%s | fan=%s",
-                htemp_f, target_f, htemp_f - target_f, mode, fan,
+        _LOGGER.info(
+            "htemp=%.1f\u00b0F | target=%.1f\u00b0F | delta=%+.1f\u00b0F | mode=%s | fan=%s",
+            htemp_f, target_f, htemp_f - target_f, mode, fan,
+        )
+
+        current_mode    = str(d.mode)
+        current_fan     = d.fan_rate
+        current_stemp_c = d.target_temp
+        already_ok = (
+            current_mode == mode
+            and current_fan == fan
+            and abs(current_stemp_c - stemp_c) < 0.25
+        )
+        if already_ok:
+            _LOGGER.debug("AC already at desired state \u2014 no command needed")
+            self.last_mode = mode
+            return
+
+        mode_changed = mode != self._last_commanded_mode
+        now = time.monotonic()
+        if mode_changed and (now - self._last_mode_switch_at) < self._opt(
+            CONF_MODE_SWITCH_MIN, DEFAULT_MODE_SWITCH_MIN
+        ):
+            _LOGGER.debug(
+                "Mode switch to %s suppressed \u2014 %.0fs since last switch",
+                mode, now - self._last_mode_switch_at,
             )
+            return
 
-            current_mode    = str(d.mode)
-            current_fan     = d.fan_rate
-            current_stemp_c = d.target_temp
-            already_ok = (
-                current_mode == mode
-                and current_fan == fan
-                and abs(current_stemp_c - stemp_c) < 0.25
-            )
-            if already_ok:
-                _LOGGER.debug("AC already at desired state — no command needed")
-                self.last_mode = mode
-                continue
+        params: dict[str, Any] = {
+            "pow":      "1",
+            "mode":     mode,
+            "stemp":    stemp_str,
+            "dt3":      stemp_str,
+            "f_rate":   fan,
+            "shum":     "0",
+            "f_dir_ud": d.f_dir_ud,
+            "f_dir_lr": d.f_dir_lr,
+            "dh3":      "0",
+        }
 
-            mode_changed = mode != self._last_commanded_mode
-            now = time.monotonic()
-            if mode_changed and (now - self._last_mode_switch_at) < self._opt(
-                CONF_MODE_SWITCH_MIN, DEFAULT_MODE_SWITCH_MIN
-            ):
-                _LOGGER.debug(
-                    "Mode switch to %s suppressed — %.0fs since last switch",
-                    mode, now - self._last_mode_switch_at,
-                )
-                continue
+        await self.coordinator.api.set_device_parameters(
+            self.coordinator.device_id, params
+        )
+        self.coordinator.set_optimistic_mode(int(mode))
+        self.coordinator.set_optimistic_fan_rate(fan)
+        self.coordinator.set_optimistic_target_temp(stemp_c)
 
-            params: dict[str, Any] = {
-                "pow":      "1",
-                "mode":     mode,
-                "stemp":    stemp_str,
-                "dt3":      stemp_str,
-                "f_rate":   fan,
-                "shum":     "0",
-                "f_dir_ud": d.f_dir_ud,
-                "f_dir_lr": d.f_dir_lr,
-                "dh3":      "0",
-            }
-
-            try:
-                await self.coordinator.api.set_device_parameters(
-                    self.coordinator.device_id, params
-                )
-                self.coordinator.set_optimistic_mode(int(mode))
-                self.coordinator.set_optimistic_fan_rate(fan)
-                self.coordinator.set_optimistic_target_temp(stemp_c)
-
-                self._last_commanded_mode  = mode
-                self._last_commanded_fan   = fan
-                self._last_commanded_stemp = target_f
-                if mode_changed:
-                    self._last_mode_switch_at = now
-                self.last_mode = mode
-                _LOGGER.info("Command sent — mode=%s fan=%s stemp=%.1f°C", mode, fan, stemp_c)
-            except Exception as e:
-                _LOGGER.error("Failed to set control: %s", e)
+        self._last_commanded_mode  = mode
+        self._last_commanded_fan   = fan
+        self._last_commanded_stemp = target_f
+        if mode_changed:
+            self._last_mode_switch_at = now
+        self.last_mode = mode
+        _LOGGER.info("Command sent \u2014 mode=%s fan=%s stemp=%.1f\u00b0C", mode, fan, stemp_c)
