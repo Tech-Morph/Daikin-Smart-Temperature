@@ -31,6 +31,12 @@ from .const import (
     CONF_SEASON_MODE,
     CONF_SUMMER_HEAT_MIN_TEMP,
     CONF_SUMMER_HEAT_NIGHT_ONLY,
+    CONF_OUTDOOR_HEAT_MAX,
+    CONF_PRECOOL_ENABLED,
+    CONF_PRECOOL_RISE_THRESHOLD,
+    CONF_PRECOOL_TOLERANCE_CUT,
+    CONF_LEARNING_LOG_ENABLED,
+    CONF_LEARNING_LOG_SIZE,
     DEFAULT_TARGET_TEMP,
     DEFAULT_TOLERANCE,
     DEFAULT_MIN_TEMP,
@@ -52,6 +58,12 @@ from .const import (
     DEFAULT_SEASON_MODE,
     DEFAULT_SUMMER_HEAT_MIN_TEMP,
     DEFAULT_SUMMER_HEAT_NIGHT_ONLY,
+    DEFAULT_OUTDOOR_HEAT_MAX,
+    DEFAULT_PRECOOL_ENABLED,
+    DEFAULT_PRECOOL_RISE_THRESHOLD,
+    DEFAULT_PRECOOL_TOLERANCE_CUT,
+    DEFAULT_LEARNING_LOG_ENABLED,
+    DEFAULT_LEARNING_LOG_SIZE,
     FAN_CAP_AUTO,
     FAN_CAP_LOW,
     FAN_CAP_MEDIUM,
@@ -141,6 +153,32 @@ class DaikinSmartTempOptionsFlow(OptionsFlow):
                 CONF_SUMMER_HEAT_NIGHT_ONLY,
                 default=o.get(CONF_SUMMER_HEAT_NIGHT_ONLY, DEFAULT_SUMMER_HEAT_NIGHT_ONLY),
             ): bool,
+            vol.Optional(
+                CONF_OUTDOOR_HEAT_MAX,
+                default=o.get(CONF_OUTDOOR_HEAT_MAX, DEFAULT_OUTDOOR_HEAT_MAX),
+            ): vol.Coerce(float),
+
+            vol.Optional(
+                CONF_PRECOOL_ENABLED,
+                default=o.get(CONF_PRECOOL_ENABLED, DEFAULT_PRECOOL_ENABLED),
+            ): bool,
+            vol.Optional(
+                CONF_PRECOOL_RISE_THRESHOLD,
+                default=o.get(CONF_PRECOOL_RISE_THRESHOLD, DEFAULT_PRECOOL_RISE_THRESHOLD),
+            ): vol.Coerce(float),
+            vol.Optional(
+                CONF_PRECOOL_TOLERANCE_CUT,
+                default=o.get(CONF_PRECOOL_TOLERANCE_CUT, DEFAULT_PRECOOL_TOLERANCE_CUT),
+            ): vol.Coerce(float),
+
+            vol.Optional(
+                CONF_LEARNING_LOG_ENABLED,
+                default=o.get(CONF_LEARNING_LOG_ENABLED, DEFAULT_LEARNING_LOG_ENABLED),
+            ): bool,
+            vol.Optional(
+                CONF_LEARNING_LOG_SIZE,
+                default=o.get(CONF_LEARNING_LOG_SIZE, DEFAULT_LEARNING_LOG_SIZE),
+            ): vol.All(vol.Coerce(int), vol.Range(min=50, max=5000)),
 
             vol.Optional(CONF_LEARNING_ENABLED, default=o.get(CONF_LEARNING_ENABLED, DEFAULT_LEARNING_ENABLED)): bool,
             vol.Optional(CONF_MORNING_OFFSET, default=o.get(CONF_MORNING_OFFSET, DEFAULT_MORNING_OFFSET)): vol.Coerce(float),
