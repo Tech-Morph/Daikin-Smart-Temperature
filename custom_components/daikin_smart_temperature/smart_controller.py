@@ -1,28 +1,35 @@
 """
 SmartTemperatureController
 
-The core brain. Runs as an async HA background task, reads htemp from
-the daikin_comfort_control coordinator (no extra API calls), and issues
-set_control_info commands when the temperature drifts outside the
-comfort band.
+The core brain. Runs as an async HA background task, reads htemp/otemp
+from the daikin_comfort_control coordinator (no extra API calls), and
+issues set_control_info commands when the temperature drifts outside
+the comfort band.
 
 Key design decisions:
   - Uses hass.async_create_background_task() so HA does NOT track this
     coroutine as a setup dependency and the bootstrap watchdog never fires.
-  - Sleep is at the END of the loop (not the start), so the very first
-    evaluation runs immediately after HA finishes starting up.
+  - Sleep is at the END of the loop, so the first cycle runs immediately.
   - Always resolves the live ConfigEntry via entry_id so options changes
     take effect on the next poll without a reload.
   - Respects allow_cool / allow_heat / allow_fan_only toggles.
   - Caps fan speed at max_fan_mode.
-  - Summer season logic: heating is suppressed unless the house has
-    dropped to/below summer_heat_min_temp, and (optionally) only at night.
+  - Summer heat gate checks BOTH indoor temp and outdoor temp (from the
+    Daikin unit's own otemp reading — no extra sensor needed) and
+    optionally restricts heating to nighttime only.
+  - Pre-cooling: tracks outdoor temp over a rolling window; if it's
+    rising quickly, tightens the tolerance band so the unit doesn't
+    coast in fan-only while outdoor heat is climbing.
+  - Rolling in-memory learning log: records each cycle's outdoor/indoor/
+    target/mode for future empirical tuning. No behavior changes from
+    the log itself yet — it's pure data collection.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import time
+from collections import deque
 from datetime import datetime, time as dtime
 from typing import Any
 
@@ -38,6 +45,9 @@ from .const import (
     CONF_ALLOW_COOL, CONF_ALLOW_HEAT, CONF_ALLOW_FAN_ONLY,
     CONF_MAX_FAN_MODE, CONF_SEASON_MODE,
     CONF_SUMMER_HEAT_MIN_TEMP, CONF_SUMMER_HEAT_NIGHT_ONLY,
+    CONF_OUTDOOR_HEAT_MAX, CONF_PRECOOL_ENABLED,
+    CONF_PRECOOL_RISE_THRESHOLD, CONF_PRECOOL_TOLERANCE_CUT,
+    CONF_LEARNING_LOG_ENABLED, CONF_LEARNING_LOG_SIZE,
     DEFAULT_TARGET_TEMP, DEFAULT_TOLERANCE, DEFAULT_MIN_TEMP, DEFAULT_MAX_TEMP,
     DEFAULT_POLL_INTERVAL, DEFAULT_MODE_SWITCH_MIN, DEFAULT_OVERRIDE_TIMEOUT,
     DEFAULT_LEARNING_ENABLED,
@@ -46,6 +56,10 @@ from .const import (
     DEFAULT_ALLOW_COOL, DEFAULT_ALLOW_HEAT, DEFAULT_ALLOW_FAN_ONLY,
     DEFAULT_MAX_FAN_MODE, DEFAULT_SEASON_MODE,
     DEFAULT_SUMMER_HEAT_MIN_TEMP, DEFAULT_SUMMER_HEAT_NIGHT_ONLY,
+    DEFAULT_OUTDOOR_HEAT_MAX, DEFAULT_PRECOOL_ENABLED,
+    DEFAULT_PRECOOL_RISE_THRESHOLD, DEFAULT_PRECOOL_TOLERANCE_CUT,
+    DEFAULT_LEARNING_LOG_ENABLED, DEFAULT_LEARNING_LOG_SIZE,
+    OUTDOOR_TREND_WINDOW_SECONDS,
     FAN_RATE_AUTO, FAN_RATE_LOW, FAN_RATE_MEDIUM, FAN_RATE_HIGH,
     FAN_CAP_AUTO, FAN_CAP_LOW, FAN_CAP_MEDIUM, FAN_CAP_HIGH,
     MODE_COOL, MODE_HEAT, MODE_FAN,
@@ -84,6 +98,12 @@ class SmartTemperatureController:
 
         self.current_target_f: float = DEFAULT_TARGET_TEMP
         self.last_mode: str = "unknown"
+
+        # Outdoor trend tracking: (timestamp, outdoor_temp_f)
+        self._outdoor_history: deque[tuple[float, float]] = deque()
+
+        # Rolling in-memory learning log (FIFO)
+        self._cycle_log: deque[dict] = deque()
 
     # ------------------------------------------------------------------ live entry
 
@@ -159,15 +179,53 @@ class SmartTemperatureController:
         now = datetime.now().time()
         return now >= dtime(22, 0) or now < dtime(6, 0)
 
+    # ------------------------------------------------------------------ outdoor trend / pre-cooling
+
+    def _record_outdoor_sample(self, outdoor_temp_f: float) -> None:
+        """Track outdoor temp over a rolling window for pre-cool detection."""
+        now = time.monotonic()
+        self._outdoor_history.append((now, outdoor_temp_f))
+        cutoff = now - OUTDOOR_TREND_WINDOW_SECONDS
+        while self._outdoor_history and self._outdoor_history[0][0] < cutoff:
+            self._outdoor_history.popleft()
+
+    def _outdoor_rising_fast(self) -> bool:
+        """True if outdoor temp has risen more than precool_rise_threshold
+        within the tracking window."""
+        if len(self._outdoor_history) < 2:
+            return False
+        oldest_temp = self._outdoor_history[0][1]
+        newest_temp = self._outdoor_history[-1][1]
+        rise = newest_temp - oldest_temp
+        threshold = self._opt(CONF_PRECOOL_RISE_THRESHOLD, DEFAULT_PRECOOL_RISE_THRESHOLD)
+        return rise >= threshold
+
+    def _effective_tolerance(self) -> float:
+        """Base tolerance, tightened when outdoor heat is climbing fast."""
+        tol = self._opt(CONF_TOLERANCE, DEFAULT_TOLERANCE)
+        if not self._opt(CONF_PRECOOL_ENABLED, DEFAULT_PRECOOL_ENABLED):
+            return tol
+        if self._outdoor_rising_fast():
+            cut = self._opt(CONF_PRECOOL_TOLERANCE_CUT, DEFAULT_PRECOOL_TOLERANCE_CUT)
+            tightened = max(0.25, tol - cut)
+            _LOGGER.debug(
+                "Pre-cool active — outdoor rising fast, tolerance %.1f -> %.1f",
+                tol, tightened,
+            )
+            return tightened
+        return tol
+
     # ------------------------------------------------------------------ mode / fan logic
 
-    def _heat_allowed_now(self, htemp_f: float) -> bool:
+    def _heat_allowed_now(self, htemp_f: float, outdoor_temp_f: float) -> bool:
         """Decide whether heating is permitted right now.
 
-        In summer season mode, heating only kicks in once the house has
-        actually dropped to/below summer_heat_min_temp, and (optionally)
-        only during the night slot — so the heater never runs during a
-        summer afternoon just because of a brief dip.
+        In summer season mode, heating only kicks in once BOTH:
+          - the house has dropped to/below summer_heat_min_temp, AND
+          - it's actually cold outside (<= outdoor_heat_max)
+        and optionally only during the night slot. This prevents the
+        heater firing just because the AC overcooled the house on a
+        mild evening.
         """
         if not self._opt(CONF_ALLOW_HEAT, DEFAULT_ALLOW_HEAT):
             return False
@@ -178,6 +236,14 @@ class SmartTemperatureController:
 
         summer_min = self._opt(CONF_SUMMER_HEAT_MIN_TEMP, DEFAULT_SUMMER_HEAT_MIN_TEMP)
         if htemp_f > summer_min:
+            return False
+
+        outdoor_max = self._opt(CONF_OUTDOOR_HEAT_MAX, DEFAULT_OUTDOOR_HEAT_MAX)
+        if outdoor_temp_f > outdoor_max:
+            _LOGGER.debug(
+                "Summer heat blocked — indoor=%.1f°F is low enough but outdoor=%.1f°F > %.1f°F cap",
+                htemp_f, outdoor_temp_f, outdoor_max,
+            )
             return False
 
         if self._opt(CONF_SUMMER_HEAT_NIGHT_ONLY, DEFAULT_SUMMER_HEAT_NIGHT_ONLY):
@@ -199,9 +265,9 @@ class SmartTemperatureController:
             return desired_rate
         return desired_rate
 
-    def _determine_mode(self, htemp_f: float, target_f: float) -> str:
+    def _determine_mode(self, htemp_f: float, target_f: float, outdoor_temp_f: float) -> str:
         delta = htemp_f - target_f
-        tol   = self._opt(CONF_TOLERANCE, DEFAULT_TOLERANCE)
+        tol   = self._effective_tolerance()
 
         allow_cool = self._opt(CONF_ALLOW_COOL, DEFAULT_ALLOW_COOL)
 
@@ -212,14 +278,14 @@ class SmartTemperatureController:
             return MODE_COOL if allow_cool else MODE_FAN
 
         # delta < -tol -> house is colder than target
-        if self._heat_allowed_now(htemp_f):
+        if self._heat_allowed_now(htemp_f, outdoor_temp_f):
             return MODE_HEAT
 
         return MODE_FAN
 
-    def _determine_fan(self, htemp_f: float, target_f: float) -> str:
+    def _determine_fan(self, htemp_f: float, target_f: float, outdoor_temp_f: float) -> str:
         delta = abs(htemp_f - target_f)
-        tol   = self._opt(CONF_TOLERANCE, DEFAULT_TOLERANCE)
+        tol   = self._effective_tolerance()
 
         if delta <= tol:
             desired = FAN_RATE_AUTO
@@ -243,6 +309,33 @@ class SmartTemperatureController:
             or (last_stemp_f is not None and abs(current_stemp_f - last_stemp_f) >= 1)
         )
 
+    # ------------------------------------------------------------------ learning log
+
+    def _record_cycle(self, outdoor_f: float, htemp_f: float, target_f: float, mode: str) -> None:
+        """Append a snapshot to the rolling learning log. Pure data
+        collection for now — no decisions are made from this yet."""
+        if not self._opt(CONF_LEARNING_LOG_ENABLED, DEFAULT_LEARNING_LOG_ENABLED):
+            return
+
+        max_size = int(self._opt(CONF_LEARNING_LOG_SIZE, DEFAULT_LEARNING_LOG_SIZE))
+        self._cycle_log.append({
+            "ts": time.time(),
+            "outdoor_f": outdoor_f,
+            "indoor_f": htemp_f,
+            "target_f": target_f,
+            "mode": mode,
+        })
+        while len(self._cycle_log) > max_size:
+            self._cycle_log.popleft()
+
+        if len(self._cycle_log) % 50 == 0:
+            _LOGGER.debug("Learning log size: %d entries", len(self._cycle_log))
+
+    @property
+    def learning_log_size(self) -> int:
+        """Exposed for a future diagnostic sensor."""
+        return len(self._cycle_log)
+
     # ------------------------------------------------------------------ main loop
 
     async def _loop(self) -> None:
@@ -250,7 +343,6 @@ class SmartTemperatureController:
         immediately on startup and never blocks the bootstrap phase."""
         _LOGGER.info("SmartTemperatureController started for %s", self.coordinator.device_id)
 
-        # Yield once so HA finishes setup before we do any real work
         await asyncio.sleep(0)
 
         while True:
@@ -284,17 +376,27 @@ class SmartTemperatureController:
             _LOGGER.warning("htemp is 0 — sensor not ready, skipping")
             return
 
-        htemp_f  = _c_to_f(htemp_c)
+        htemp_f = _c_to_f(htemp_c)
+
+        outdoor_c = getattr(d, "outdoor_temp", None)
+        outdoor_f = _c_to_f(outdoor_c) if outdoor_c not in (None, 0.0) else htemp_f
+        if outdoor_c in (None, 0.0):
+            _LOGGER.debug("otemp unavailable this cycle — using htemp as fallback for outdoor-aware logic")
+
+        self._record_outdoor_sample(outdoor_f)
+
         target_f = self._target_temp_f()
         self.current_target_f = target_f
 
         _LOGGER.debug(
-            "season=%s allow_cool=%s allow_heat=%s allow_fan_only=%s max_fan=%s",
+            "season=%s allow_cool=%s allow_heat=%s allow_fan_only=%s max_fan=%s outdoor=%.1f°F precool_active=%s",
             self._opt(CONF_SEASON_MODE, DEFAULT_SEASON_MODE),
             self._opt(CONF_ALLOW_COOL, DEFAULT_ALLOW_COOL),
             self._opt(CONF_ALLOW_HEAT, DEFAULT_ALLOW_HEAT),
             self._opt(CONF_ALLOW_FAN_ONLY, DEFAULT_ALLOW_FAN_ONLY),
             self._opt(CONF_MAX_FAN_MODE, DEFAULT_MAX_FAN_MODE),
+            outdoor_f,
+            self._outdoor_rising_fast(),
         )
 
         override_timeout = self._opt(CONF_OVERRIDE_TIMEOUT, DEFAULT_OVERRIDE_TIMEOUT)
@@ -308,16 +410,18 @@ class SmartTemperatureController:
             _LOGGER.debug("Override active (%.0fs remaining)", self._override_until - time.monotonic())
             return
 
-        mode = self._determine_mode(htemp_f, target_f)
-        fan  = self._determine_fan(htemp_f, target_f)
+        mode = self._determine_mode(htemp_f, target_f, outdoor_f)
+        fan  = self._determine_fan(htemp_f, target_f, outdoor_f)
+
+        self._record_cycle(outdoor_f, htemp_f, target_f, mode)
 
         target_c  = (target_f - 32) * 5 / 9
         stemp_c   = round(target_c * 2) / 2
         stemp_str = str(stemp_c)
 
         _LOGGER.info(
-            "htemp=%.1f°F | target=%.1f°F | delta=%+.1f°F | mode=%s | fan=%s",
-            htemp_f, target_f, htemp_f - target_f, mode, fan,
+            "htemp=%.1f°F | outdoor=%.1f°F | target=%.1f°F | delta=%+.1f°F | mode=%s | fan=%s",
+            htemp_f, outdoor_f, target_f, htemp_f - target_f, mode, fan,
         )
 
         current_mode    = str(d.mode)
