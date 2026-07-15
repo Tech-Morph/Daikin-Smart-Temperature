@@ -11,34 +11,34 @@ This is a **companion integration** — it does not talk to the Daikin cloud dir
 ## How It Works
 
 ┌─────────────────────────────────────────────────────────────┐
-│ daikin_comfort_control (required) │
-│ │
-│ DaikinCoordinator DaikinComfortControlAPI │
-│ .data.indoor_temp ──── read ──► (already authenticated) │
-│ .data.outdoor_temp scr.daikincloud.net │
-│ .data.target_temp │
-│ .data.mode / fan_rate │
-│ │ .set_optimistic_*() ◄── update │
-│ │ .api.set_device_parameters() ◄── write ──┘ │
+│ daikin_comfort_control (required)                            │
+│                                                                │
+│  DaikinCoordinator                    DaikinComfortControlAPI │
+│  .data.indoor_temp   ──── read ────►  (already authenticated) │
+│  .data.outdoor_temp                   scr.daikincloud.net      │
+│  .data.target_temp                                            │
+│  .data.mode / fan_rate     │                                  │
+│                            │ .set_optimistic_*()   ◄── update │
+│                            │ .api.set_device_parameters() ◄── write ──┘ │
 └─────────────────────────────────────────────────────────────┘
-▲ borrows coordinator at startup
-│
+                           ▲ borrows coordinator at startup
+                           │
 ┌─────────────────────────────────────────────────────────────┐
-│ daikin_smart_temperature (this integration) │
-│ │
-│ SmartTemperatureController (async HA background task) │
-│ 1. Sleep poll_interval (default 60s) │
-│ 2. Read htemp/otemp °C from coordinator.data │
-│ 3. Track outdoor trend (30-min rolling window) │
-│ 4. Compute effective target °F (base + time-slot offset) │
-│ 5. Compute effective tolerance (tighter if outdoor rising) │
-│ 6. Check for manual override (app/remote changed state) │
-│ 7. Determine mode: cool / heat / fan-only (season-aware) │
-│ 8. Determine fan speed, capped at max_fan_mode │
-│ 9. Log cycle snapshot to rolling learning log │
-│ 10. No-op if AC already at desired mode+fan+setpoint │
-│ 11. Short-cycle guard: min 5min between mode switches │
-│ 12. Call api.set_device_parameters() + optimistic update │
+│ daikin_smart_temperature (this integration)                  │
+│                                                                │
+│  SmartTemperatureController (async HA background task)       │
+│   1. Sleep poll_interval (default 60s)                       │
+│   2. Read htemp/otemp °C from coordinator.data               │
+│   3. Track outdoor trend (30-min rolling window)              │
+│   4. Compute effective target °F (base + time-slot offset)   │
+│   5. Compute effective tolerance (tighter if outdoor rising) │
+│   6. Check for manual override (app/remote changed state)    │
+│   7. Determine mode: cool / heat / fan-only (season-aware)   │
+│   8. Determine fan speed, capped at max_fan_mode             │
+│   9. Log cycle snapshot to rolling learning log              │
+│  10. No-op if AC already at desired mode+fan+setpoint         │
+│  11. Short-cycle guard: min 5min between mode switches        │
+│  12. Call api.set_device_parameters() + optimistic update    │
 └─────────────────────────────────────────────────────────────┘
 
 ### Temperature Source
