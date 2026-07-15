@@ -29,13 +29,15 @@ CONF_SEASON_MODE = "season_mode"
 CONF_SUMMER_HEAT_MIN_TEMP = "summer_heat_min_temp"
 CONF_SUMMER_HEAT_NIGHT_ONLY = "summer_heat_night_only"
 
-# Outdoor-aware additions
 CONF_OUTDOOR_HEAT_MAX = "outdoor_heat_max"
 CONF_PRECOOL_ENABLED = "precool_enabled"
 CONF_PRECOOL_RISE_THRESHOLD = "precool_rise_threshold"
 CONF_PRECOOL_TOLERANCE_CUT = "precool_tolerance_cut"
 CONF_LEARNING_LOG_ENABLED = "learning_log_enabled"
 CONF_LEARNING_LOG_SIZE = "learning_log_size"
+
+# Safety bypass — forces correction even if a manual-override pause is active
+CONF_SAFETY_OVERRIDE_DELTA = "safety_override_delta"
 
 FAN_RATE_AUTO = "A"
 FAN_RATE_LOW = "2"
@@ -54,7 +56,7 @@ FAN_CAP_HIGH = "high"
 SEASON_NORMAL = "normal"
 SEASON_SUMMER = "summer"
 
-DEFAULT_TARGET_TEMP = 72.0
+DEFAULT_TARGET_TEMP = 70.0
 DEFAULT_TOLERANCE = 2.0
 DEFAULT_MIN_TEMP = 65.0
 DEFAULT_MAX_TEMP = 85.0
@@ -85,6 +87,10 @@ DEFAULT_PRECOOL_RISE_THRESHOLD = 3.0
 DEFAULT_PRECOOL_TOLERANCE_CUT = 0.5
 DEFAULT_LEARNING_LOG_ENABLED = True
 DEFAULT_LEARNING_LOG_SIZE = 500
+
+# If actual delta from target reaches/exceeds this, force correction even
+# during an active manual-override pause. Prevents overnight runaway drift.
+DEFAULT_SAFETY_OVERRIDE_DELTA = 4.0
 
 # Outdoor trend tracking window, in seconds
 OUTDOOR_TREND_WINDOW_SECONDS = 1800
