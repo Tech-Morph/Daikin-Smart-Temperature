@@ -28,8 +28,9 @@ Key design decisions:
     and blocked _determine_mode() from ever running again.
   - Safety bypass: even if an override pause IS active, a delta from
     target that reaches safety_override_delta forces the pause to
-    clear immediately so the unit can correct. This is the hard
-    backstop against any future overnight runaway, regardless of cause.
+    clear immediately so the unit can correct. Also bypasses the
+    mode-switch short-cycle guard under the same condition. This is
+    the hard backstop against any future overnight runaway.
 """
 from __future__ import annotations
 
