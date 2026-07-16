@@ -34,6 +34,7 @@
           "precool_enabled": "Enable outdoor-trend pre-cooling",
           "precool_rise_threshold": "Pre-cool trigger: outdoor rise over 30 min (°F)",
           "precool_tolerance_cut": "Pre-cool tolerance reduction (°F)",
+          "safety_override_delta": "Safety bypass: force correction if delta exceeds (°F)",
           "learning_log_enabled": "Enable rolling learning log",
           "learning_log_size": "Learning log max entries",
           "learning_enabled": "Enable time-of-day offsets",
