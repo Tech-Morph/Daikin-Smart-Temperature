@@ -23,14 +23,16 @@ Key design decisions:
     target/mode for future empirical tuning.
   - Manual-override detection IGNORES setpoint comparisons while the
     last commanded mode was fan-only, since Daikin units frequently
-    report a stale/meaningless stemp value in that mode — this was
-    causing false-positive overrides that silently re-armed forever
-    and blocked _determine_mode() from ever running again.
+    report a stale/meaningless stemp value in that mode.
   - Safety bypass: even if an override pause IS active, a delta from
     target that reaches safety_override_delta forces the pause to
-    clear immediately so the unit can correct. Also bypasses the
-    mode-switch short-cycle guard under the same condition. This is
-    the hard backstop against any future overnight runaway.
+    clear immediately. Also bypasses the mode-switch short-cycle guard
+    under the same condition.
+  - Entity push notifications: sensors use should_poll=False, so every
+    cycle that updates current_target_f / last_mode MUST explicitly
+    call _notify_entities() or the frontend freezes on stale/Unknown
+    values until the options flow is opened (which was the only code
+    path previously calling the callback list).
 """
 from __future__ import annotations
 
@@ -147,7 +149,21 @@ class SmartTemperatureController:
         _LOGGER.info("Smart temperature automation %s", "enabled" if enabled else "disabled")
 
     def register_options_callback(self, cb) -> None:
+        """Sensors/switch entities register here (should_poll=False) so
+        they can be told to refresh whenever state actually changes."""
         self._options_updated_callbacks.append(cb)
+
+    def _notify_entities(self) -> None:
+        """Push updated state to all registered entities.
+
+        Called both after options are saved AND after every control
+        cycle that changes current_target_f / last_mode. Without this
+        being called from _run_cycle(), sensors freeze on their initial
+        (often Unknown/placeholder) value after every restart until the
+        options flow happens to be opened.
+        """
+        for cb in self._options_updated_callbacks:
+            cb()
 
     def options_updated(self) -> None:
         """Called by __init__.py update listener when options are saved."""
@@ -157,8 +173,7 @@ class SmartTemperatureController:
             self.current_target_f,
             self._opt(CONF_MAX_TEMP, DEFAULT_MAX_TEMP),
         )
-        for cb in self._options_updated_callbacks:
-            cb()
+        self._notify_entities()
 
     # ------------------------------------------------------------------ options helpers
 
@@ -314,10 +329,9 @@ class SmartTemperatureController:
         IMPORTANT: while the last commanded mode was fan-only, the
         setpoint (stemp) reported by the unit is frequently stale or
         firmware-defaulted and meaningless. Comparing it in that state
-        was causing false-positive overrides on nearly every poll,
-        which continuously re-armed the override pause and blocked
-        _determine_mode() from ever running — this was the root cause
-        of the overnight fan-mode-stuck-at-74°F issue.
+        caused false-positive overrides on nearly every poll, which
+        continuously re-armed the override pause and blocked
+        _determine_mode() from ever running.
         """
         if self._last_commanded_mode is None:
             return False
@@ -448,6 +462,7 @@ class SmartTemperatureController:
                     "Override active (%.0fs remaining, delta=%.1f°F below safety threshold %.1f°F)",
                     self._override_until - time.monotonic(), delta_now, safety_delta,
                 )
+                self._notify_entities()
                 return
 
         mode = self._determine_mode(htemp_f, target_f, outdoor_f)
@@ -475,6 +490,7 @@ class SmartTemperatureController:
         if already_ok:
             _LOGGER.debug("AC already at desired state — no command needed")
             self.last_mode = mode
+            self._notify_entities()
             return
 
         mode_changed = mode != self._last_commanded_mode
@@ -492,6 +508,7 @@ class SmartTemperatureController:
                     "Mode switch to %s suppressed — %.0fs since last switch",
                     mode, now - self._last_mode_switch_at,
                 )
+                self._notify_entities()
                 return
 
         params: dict[str, Any] = {
@@ -520,3 +537,4 @@ class SmartTemperatureController:
             self._last_mode_switch_at = now
         self.last_mode = mode
         _LOGGER.info("Command sent — mode=%s fan=%s stemp=%.1f°C", mode, fan, stemp_c)
+        self._notify_entities()
