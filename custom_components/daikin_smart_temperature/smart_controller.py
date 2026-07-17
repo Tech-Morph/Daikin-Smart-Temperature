@@ -14,32 +14,35 @@ Key design decisions:
     take effect on the next poll without a reload.
   - Respects allow_cool / allow_heat / allow_fan_only toggles.
   - Caps fan speed at max_fan_mode.
-  - Summer heat gate checks BOTH indoor temp and outdoor temp (from the
-    Daikin unit's own otemp reading) and optionally restricts heating
-    to nighttime only.
+  - Summer heat gate checks BOTH indoor temp and outdoor temp.
   - Pre-cooling: tracks outdoor temp over a rolling window; if it's
     rising quickly, tightens the tolerance band.
-  - Rolling in-memory learning log: records each cycle's outdoor/indoor/
-    target/mode for future empirical tuning.
+  - Rolling in-memory learning log for future empirical tuning.
   - Manual-override detection IGNORES setpoint comparisons while the
-    last commanded mode was fan-only, since Daikin units frequently
-    report a stale/meaningless stemp value in that mode.
-  - Safety bypass: even if an override pause IS active, a delta from
-    target that reaches safety_override_delta forces the pause to
-    clear immediately. Also bypasses the mode-switch short-cycle guard
-    under the same condition.
-  - De-escalation exception: mode is now computed BEFORE the override
-    check. If the freshly-computed mode is fan-only (i.e. the room is
-    back within tolerance), the override pause is ALWAYS bypassed for
-    that single decision, unconditionally, with no threshold needed.
-    Backing off to fan-only is never harmful even if a human touched
-    the unit recently — only escalating INTO cool/heat is gated by the
-    override pause. Without this, a mild overshoot inside an active
-    override window could sit uncorrected indefinitely (cool running
-    below target) until the integration was manually reloaded.
+    last commanded mode was fan-only (stale/meaningless stemp there).
+  - Safety bypass: a delta from target that reaches safety_override_delta
+    forces the override pause to clear immediately.
+  - De-escalation exception: mode is computed BEFORE the override check.
+    If the freshly-computed mode is fan-only, the override pause is
+    ALWAYS bypassed for that decision — backing off to fan-only is
+    never harmful even if a human touched the unit recently.
+  - LAYER 1 — Hard fan-only ceiling: independent of the target/tolerance
+    math, if indoor temp exceeds fan_ceiling_temp while in fan-only,
+    mode is force-overridden to cool immediately. This is a hard safety
+    rail, not a discretionary decision — it always bypasses the override
+    pause and the mode-switch short-cycle guard.
+  - LAYER 2 — Forecast-aware pre-cooling: periodically (every
+    forecast_check_interval_cycles cycles, not every cycle, to respect
+    weather API rate limits) fetches today's forecast high via
+    weather.get_forecasts. If the forecast high exceeds
+    forecast_high_threshold, tolerance is pre-emptively tightened by
+    forecast_precool_tolerance_cut, stacking with the existing
+    outdoor-trend pre-cool cut. Fails safe — any fetch error just
+    skips forecast-based tightening for that cycle, never blocks
+    the main control loop.
   - Entity push notifications: sensors use should_poll=False, so every
     cycle that updates current_target_f / last_mode explicitly calls
-    _notify_entities() or the frontend freezes on stale values.
+    _notify_entities().
 """
 from __future__ import annotations
 
@@ -66,6 +69,10 @@ from .const import (
     CONF_PRECOOL_RISE_THRESHOLD, CONF_PRECOOL_TOLERANCE_CUT,
     CONF_LEARNING_LOG_ENABLED, CONF_LEARNING_LOG_SIZE,
     CONF_SAFETY_OVERRIDE_DELTA,
+    CONF_FAN_CEILING_ENABLED, CONF_FAN_CEILING_TEMP,
+    CONF_WEATHER_ENTITY, CONF_FORECAST_PRECOOL_ENABLED,
+    CONF_FORECAST_HIGH_THRESHOLD, CONF_FORECAST_PRECOOL_TOLERANCE_CUT,
+    CONF_FORECAST_CHECK_INTERVAL_CYCLES,
     DEFAULT_TARGET_TEMP, DEFAULT_TOLERANCE, DEFAULT_MIN_TEMP, DEFAULT_MAX_TEMP,
     DEFAULT_POLL_INTERVAL, DEFAULT_MODE_SWITCH_MIN, DEFAULT_OVERRIDE_TIMEOUT,
     DEFAULT_LEARNING_ENABLED,
@@ -78,6 +85,9 @@ from .const import (
     DEFAULT_PRECOOL_RISE_THRESHOLD, DEFAULT_PRECOOL_TOLERANCE_CUT,
     DEFAULT_LEARNING_LOG_ENABLED, DEFAULT_LEARNING_LOG_SIZE,
     DEFAULT_SAFETY_OVERRIDE_DELTA,
+    DEFAULT_FAN_CEILING_ENABLED, DEFAULT_FAN_CEILING_TEMP,
+    DEFAULT_FORECAST_PRECOOL_ENABLED, DEFAULT_FORECAST_HIGH_THRESHOLD,
+    DEFAULT_FORECAST_PRECOOL_TOLERANCE_CUT, DEFAULT_FORECAST_CHECK_INTERVAL_CYCLES,
     OUTDOOR_TREND_WINDOW_SECONDS,
     FAN_RATE_AUTO, FAN_RATE_LOW, FAN_RATE_MEDIUM, FAN_RATE_HIGH,
     FAN_CAP_AUTO, FAN_CAP_LOW, FAN_CAP_MEDIUM, FAN_CAP_HIGH,
@@ -120,6 +130,11 @@ class SmartTemperatureController:
 
         self._outdoor_history: deque[tuple[float, float]] = deque()
         self._cycle_log: deque[dict] = deque()
+
+        # Layer 2 — forecast cache
+        self._cycle_count: int = 0
+        self._forecast_high_f: float | None = None
+        self._forecast_fetch_failed: bool = False
 
     # ------------------------------------------------------------------ live entry
 
@@ -208,19 +223,80 @@ class SmartTemperatureController:
         threshold = self._opt(CONF_PRECOOL_RISE_THRESHOLD, DEFAULT_PRECOOL_RISE_THRESHOLD)
         return rise >= threshold
 
-    def _effective_tolerance(self) -> float:
-        tol = self._opt(CONF_TOLERANCE, DEFAULT_TOLERANCE)
-        if not self._opt(CONF_PRECOOL_ENABLED, DEFAULT_PRECOOL_ENABLED):
-            return tol
-        if self._outdoor_rising_fast():
-            cut = self._opt(CONF_PRECOOL_TOLERANCE_CUT, DEFAULT_PRECOOL_TOLERANCE_CUT)
-            tightened = max(0.25, tol - cut)
-            _LOGGER.debug(
-                "Pre-cool active — outdoor rising fast, tolerance %.1f -> %.1f",
-                tol, tightened,
+    # ------------------------------------------------------------------ Layer 2: forecast
+
+    async def _maybe_refresh_forecast(self) -> None:
+        """Fetch today's forecast high every N cycles (not every cycle,
+        to respect weather API rate limits). Fails safe — any error just
+        clears the cached forecast so forecast-based tightening is
+        skipped, never raises into the main control loop."""
+        if not self._opt(CONF_FORECAST_PRECOOL_ENABLED, DEFAULT_FORECAST_PRECOOL_ENABLED):
+            return
+
+        weather_entity = self._opt(CONF_WEATHER_ENTITY, None)
+        if not weather_entity:
+            return
+
+        interval = int(self._opt(
+            CONF_FORECAST_CHECK_INTERVAL_CYCLES, DEFAULT_FORECAST_CHECK_INTERVAL_CYCLES
+        ))
+        if self._cycle_count % max(1, interval) != 0:
+            return
+
+        try:
+            response = await self.hass.services.async_call(
+                "weather", "get_forecasts",
+                {"entity_id": weather_entity, "type": "daily"},
+                blocking=True, return_response=True,
             )
-            return tightened
-        return tol
+            forecasts = response.get(weather_entity, {}).get("forecast", [])
+            if not forecasts:
+                _LOGGER.debug("Forecast response empty for %s", weather_entity)
+                self._forecast_high_f = None
+                return
+
+            today = forecasts[0]
+            temp_c = today.get("temperature")
+            if temp_c is None:
+                self._forecast_high_f = None
+                return
+
+            self._forecast_high_f = _c_to_f(temp_c)
+            self._forecast_fetch_failed = False
+            _LOGGER.debug("Forecast high refreshed: %.1f°F", self._forecast_high_f)
+        except Exception:  # noqa: BLE001
+            if not self._forecast_fetch_failed:
+                _LOGGER.warning("Forecast fetch failed for %s — skipping forecast pre-cool this cycle", weather_entity, exc_info=True)
+            self._forecast_fetch_failed = True
+            self._forecast_high_f = None
+
+    def _forecast_precool_active(self) -> bool:
+        if not self._opt(CONF_FORECAST_PRECOOL_ENABLED, DEFAULT_FORECAST_PRECOOL_ENABLED):
+            return False
+        if self._forecast_high_f is None:
+            return False
+        threshold = self._opt(CONF_FORECAST_HIGH_THRESHOLD, DEFAULT_FORECAST_HIGH_THRESHOLD)
+        return self._forecast_high_f >= threshold
+
+    def _effective_tolerance(self) -> float:
+        """Base tolerance, tightened by outdoor-trend pre-cool and/or
+        forecast-based pre-cool. The two cuts stack if both are active."""
+        tol = self._opt(CONF_TOLERANCE, DEFAULT_TOLERANCE)
+
+        if self._opt(CONF_PRECOOL_ENABLED, DEFAULT_PRECOOL_ENABLED) and self._outdoor_rising_fast():
+            cut = self._opt(CONF_PRECOOL_TOLERANCE_CUT, DEFAULT_PRECOOL_TOLERANCE_CUT)
+            tol -= cut
+            _LOGGER.debug("Outdoor-trend pre-cool active — tolerance cut by %.1f", cut)
+
+        if self._forecast_precool_active():
+            cut = self._opt(CONF_FORECAST_PRECOOL_TOLERANCE_CUT, DEFAULT_FORECAST_PRECOOL_TOLERANCE_CUT)
+            tol -= cut
+            _LOGGER.debug(
+                "Forecast pre-cool active (high=%.1f°F) — tolerance cut by %.1f",
+                self._forecast_high_f, cut,
+            )
+
+        return max(0.25, tol)
 
     # ------------------------------------------------------------------ mode / fan logic
 
@@ -279,6 +355,37 @@ class SmartTemperatureController:
 
         return MODE_FAN
 
+    def _apply_fan_ceiling(self, mode: str, htemp_f: float, current_mode: str) -> str:
+        """LAYER 1 — Hard safety ceiling, independent of tolerance math.
+
+        If we are currently in fan-only (per the AC's own reported state,
+        not just our computed mode) and indoor temp has climbed above
+        fan_ceiling_temp, force cool regardless of what the tolerance
+        band says. This is a hard rail, not a discretionary choice —
+        callers must treat a ceiling override as always bypassing the
+        manual-override pause and the mode-switch short-cycle guard.
+        """
+        if not self._opt(CONF_FAN_CEILING_ENABLED, DEFAULT_FAN_CEILING_ENABLED):
+            return mode
+
+        if current_mode != MODE_FAN:
+            return mode
+
+        ceiling = self._opt(CONF_FAN_CEILING_TEMP, DEFAULT_FAN_CEILING_TEMP)
+        if htemp_f > ceiling:
+            allow_cool = self._opt(CONF_ALLOW_COOL, DEFAULT_ALLOW_COOL)
+            if allow_cool:
+                _LOGGER.warning(
+                    "Fan-only ceiling exceeded — htemp=%.1f°F > %.1f°F ceiling, forcing cool",
+                    htemp_f, ceiling,
+                )
+                return MODE_COOL
+            _LOGGER.warning(
+                "Fan-only ceiling exceeded (htemp=%.1f°F > %.1f°F) but cooling is disabled",
+                htemp_f, ceiling,
+            )
+        return mode
+
     def _determine_fan(self, htemp_f: float, target_f: float, outdoor_temp_f: float) -> str:
         delta = abs(htemp_f - target_f)
         tol   = self._effective_tolerance()
@@ -325,6 +432,7 @@ class SmartTemperatureController:
             "indoor_f": htemp_f,
             "target_f": target_f,
             "mode": mode,
+            "forecast_high_f": self._forecast_high_f,
         })
         while len(self._cycle_log) > max_size:
             self._cycle_log.popleft()
@@ -382,31 +490,42 @@ class SmartTemperatureController:
             _LOGGER.debug("otemp unavailable this cycle — using htemp as fallback")
 
         self._record_outdoor_sample(outdoor_f)
+        self._cycle_count += 1
+        await self._maybe_refresh_forecast()
 
         target_f = self._target_temp_f()
         self.current_target_f = target_f
 
         _LOGGER.debug(
-            "season=%s allow_cool=%s allow_heat=%s allow_fan_only=%s max_fan=%s outdoor=%.1f°F precool_active=%s",
+            "season=%s allow_cool=%s allow_heat=%s max_fan=%s outdoor=%.1f°F precool_active=%s forecast_high=%s ceiling=%.1f°F",
             self._opt(CONF_SEASON_MODE, DEFAULT_SEASON_MODE),
             self._opt(CONF_ALLOW_COOL, DEFAULT_ALLOW_COOL),
             self._opt(CONF_ALLOW_HEAT, DEFAULT_ALLOW_HEAT),
-            self._opt(CONF_ALLOW_FAN_ONLY, DEFAULT_ALLOW_FAN_ONLY),
             self._opt(CONF_MAX_FAN_MODE, DEFAULT_MAX_FAN_MODE),
             outdoor_f,
             self._outdoor_rising_fast(),
+            self._forecast_high_f,
+            self._opt(CONF_FAN_CEILING_TEMP, DEFAULT_FAN_CEILING_TEMP),
         )
 
-        # Compute the prospective mode BEFORE checking the override pause.
-        # This is required so we know whether this cycle wants to
-        # de-escalate to fan-only (always allowed) or escalate into
-        # cool/heat (gated by the override pause).
+        current_mode_reported = str(d.mode)
+
         mode = self._determine_mode(htemp_f, target_f, outdoor_f)
         fan  = self._determine_fan(htemp_f, target_f, outdoor_f)
 
+        # LAYER 1 — hard ceiling check, evaluated against the AC's
+        # actual current reported mode (not our computed mode), so it
+        # catches the real-world "stuck in fan-only and climbing" case.
+        ceiling_forced = False
+        pre_ceiling_mode = mode
+        mode = self._apply_fan_ceiling(mode, htemp_f, current_mode_reported)
+        if mode != pre_ceiling_mode:
+            ceiling_forced = True
+            fan = self._determine_fan(htemp_f, target_f, outdoor_f)  # recompute fan for new mode context
+
         override_timeout = self._opt(CONF_OVERRIDE_TIMEOUT, DEFAULT_OVERRIDE_TIMEOUT)
         if override_timeout > 0 and self._detect_manual_override(
-            str(d.mode), d.fan_rate, d.target_temp
+            current_mode_reported, d.fan_rate, d.target_temp
         ):
             self._override_until = time.monotonic() + override_timeout
             _LOGGER.info("Manual override detected — pausing for %ds", override_timeout)
@@ -417,10 +536,15 @@ class SmartTemperatureController:
         override_active = time.monotonic() < self._override_until
         is_deescalation  = mode == MODE_FAN
 
-        if override_active and not is_deescalation:
+        if ceiling_forced:
+            # Hard safety rail — always bypasses override pause entirely.
+            if override_active:
+                _LOGGER.warning("Ceiling override bypassing active manual-override pause")
+                self._override_until = 0.0
+        elif override_active and not is_deescalation:
             if delta_now >= safety_delta:
                 _LOGGER.warning(
-                    "Safety bypass triggered — delta=%.1f°F >= %.1f°F, clearing override pause to force correction",
+                    "Safety bypass triggered — delta=%.1f°F >= %.1f°F, clearing override pause",
                     delta_now, safety_delta,
                 )
                 self._override_until = 0.0
@@ -432,9 +556,7 @@ class SmartTemperatureController:
                 self._notify_entities()
                 return
         elif override_active and is_deescalation:
-            _LOGGER.debug(
-                "Override active but de-escalating to fan-only — always allowed regardless of pause"
-            )
+            _LOGGER.debug("Override active but de-escalating to fan-only — always allowed")
 
         self._record_cycle(outdoor_f, htemp_f, target_f, mode)
 
@@ -443,15 +565,15 @@ class SmartTemperatureController:
         stemp_str = str(stemp_c)
 
         _LOGGER.info(
-            "htemp=%.1f°F | outdoor=%.1f°F | target=%.1f°F | delta=%+.1f°F | mode=%s | fan=%s",
+            "htemp=%.1f°F | outdoor=%.1f°F | target=%.1f°F | delta=%+.1f°F | mode=%s | fan=%s%s",
             htemp_f, outdoor_f, target_f, htemp_f - target_f, mode, fan,
+            " | CEILING FORCED" if ceiling_forced else "",
         )
 
-        current_mode    = str(d.mode)
         current_fan     = d.fan_rate
         current_stemp_c = d.target_temp
         already_ok = (
-            current_mode == mode
+            current_mode_reported == mode
             and current_fan == fan
             and abs(current_stemp_c - stemp_c) < 0.25
         )
@@ -463,21 +585,20 @@ class SmartTemperatureController:
 
         mode_changed = mode != self._last_commanded_mode
         now = time.monotonic()
-        if mode_changed and not is_deescalation and (now - self._last_mode_switch_at) < self._opt(
+        bypass_switch_guard = is_deescalation or ceiling_forced or delta_now >= safety_delta
+        if mode_changed and not bypass_switch_guard and (now - self._last_mode_switch_at) < self._opt(
             CONF_MODE_SWITCH_MIN, DEFAULT_MODE_SWITCH_MIN
         ):
-            if delta_now >= safety_delta:
-                _LOGGER.warning(
-                    "Mode-switch guard bypassed — delta=%.1f°F >= safety threshold %.1f°F",
-                    delta_now, safety_delta,
-                )
-            else:
-                _LOGGER.debug(
-                    "Mode switch to %s suppressed — %.0fs since last switch",
-                    mode, now - self._last_mode_switch_at,
-                )
-                self._notify_entities()
-                return
+            _LOGGER.debug(
+                "Mode switch to %s suppressed — %.0fs since last switch",
+                mode, now - self._last_mode_switch_at,
+            )
+            self._notify_entities()
+            return
+        elif mode_changed and bypass_switch_guard and (now - self._last_mode_switch_at) < self._opt(
+            CONF_MODE_SWITCH_MIN, DEFAULT_MODE_SWITCH_MIN
+        ):
+            _LOGGER.warning("Mode-switch guard bypassed (ceiling=%s, safety_delta=%s)", ceiling_forced, delta_now >= safety_delta)
 
         params: dict[str, Any] = {
             "pow":      "1",
