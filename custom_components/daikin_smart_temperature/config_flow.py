@@ -5,6 +5,7 @@ import voluptuous as vol
 from homeassistant.config_entries import ConfigFlow, OptionsFlow, ConfigEntry
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
+from homeassistant.helpers import selector
 
 from .const import (
     DOMAIN,
@@ -38,6 +39,13 @@ from .const import (
     CONF_LEARNING_LOG_ENABLED,
     CONF_LEARNING_LOG_SIZE,
     CONF_SAFETY_OVERRIDE_DELTA,
+    CONF_FAN_CEILING_ENABLED,
+    CONF_FAN_CEILING_TEMP,
+    CONF_WEATHER_ENTITY,
+    CONF_FORECAST_PRECOOL_ENABLED,
+    CONF_FORECAST_HIGH_THRESHOLD,
+    CONF_FORECAST_PRECOOL_TOLERANCE_CUT,
+    CONF_FORECAST_CHECK_INTERVAL_CYCLES,
     DEFAULT_TARGET_TEMP,
     DEFAULT_TOLERANCE,
     DEFAULT_MIN_TEMP,
@@ -66,6 +74,12 @@ from .const import (
     DEFAULT_LEARNING_LOG_ENABLED,
     DEFAULT_LEARNING_LOG_SIZE,
     DEFAULT_SAFETY_OVERRIDE_DELTA,
+    DEFAULT_FAN_CEILING_ENABLED,
+    DEFAULT_FAN_CEILING_TEMP,
+    DEFAULT_FORECAST_PRECOOL_ENABLED,
+    DEFAULT_FORECAST_HIGH_THRESHOLD,
+    DEFAULT_FORECAST_PRECOOL_TOLERANCE_CUT,
+    DEFAULT_FORECAST_CHECK_INTERVAL_CYCLES,
     FAN_CAP_AUTO,
     FAN_CAP_LOW,
     FAN_CAP_MEDIUM,
@@ -159,6 +173,40 @@ class DaikinSmartTempOptionsFlow(OptionsFlow):
                 CONF_OUTDOOR_HEAT_MAX,
                 default=o.get(CONF_OUTDOOR_HEAT_MAX, DEFAULT_OUTDOOR_HEAT_MAX),
             ): vol.Coerce(float),
+
+            # Layer 1 — hard fan-only ceiling
+            vol.Optional(
+                CONF_FAN_CEILING_ENABLED,
+                default=o.get(CONF_FAN_CEILING_ENABLED, DEFAULT_FAN_CEILING_ENABLED),
+            ): bool,
+            vol.Optional(
+                CONF_FAN_CEILING_TEMP,
+                default=o.get(CONF_FAN_CEILING_TEMP, DEFAULT_FAN_CEILING_TEMP),
+            ): vol.Coerce(float),
+
+            # Layer 2 — forecast-aware pre-cooling
+            vol.Optional(
+                CONF_WEATHER_ENTITY,
+                default=o.get(CONF_WEATHER_ENTITY, ""),
+            ): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="weather")
+            ),
+            vol.Optional(
+                CONF_FORECAST_PRECOOL_ENABLED,
+                default=o.get(CONF_FORECAST_PRECOOL_ENABLED, DEFAULT_FORECAST_PRECOOL_ENABLED),
+            ): bool,
+            vol.Optional(
+                CONF_FORECAST_HIGH_THRESHOLD,
+                default=o.get(CONF_FORECAST_HIGH_THRESHOLD, DEFAULT_FORECAST_HIGH_THRESHOLD),
+            ): vol.Coerce(float),
+            vol.Optional(
+                CONF_FORECAST_PRECOOL_TOLERANCE_CUT,
+                default=o.get(CONF_FORECAST_PRECOOL_TOLERANCE_CUT, DEFAULT_FORECAST_PRECOOL_TOLERANCE_CUT),
+            ): vol.Coerce(float),
+            vol.Optional(
+                CONF_FORECAST_CHECK_INTERVAL_CYCLES,
+                default=o.get(CONF_FORECAST_CHECK_INTERVAL_CYCLES, DEFAULT_FORECAST_CHECK_INTERVAL_CYCLES),
+            ): vol.All(vol.Coerce(int), vol.Range(min=1, max=120)),
 
             vol.Optional(
                 CONF_PRECOOL_ENABLED,
