@@ -26,11 +26,15 @@ Key design decisions:
     If the freshly-computed mode is fan-only, the override pause is
     ALWAYS bypassed for that decision — backing off to fan-only is
     never harmful even if a human touched the unit recently.
-  - LAYER 1 — Hard fan-only ceiling: independent of the target/tolerance
-    math, if indoor temp exceeds fan_ceiling_temp while in fan-only,
-    mode is force-overridden to cool immediately. This is a hard safety
-    rail, not a discretionary decision — it always bypasses the override
-    pause and the mode-switch short-cycle guard.
+  - LAYER 1 — Hard fan-only ceiling WITH HYSTERESIS: independent of the
+    target/tolerance math, if indoor temp exceeds fan_ceiling_temp while
+    in fan-only, mode is force-overridden to cool immediately. Once
+    forced into cool, it STAYS in cool (self._ceiling_active) until
+    htemp drops fan_ceiling_hysteresis degrees BELOW the ceiling, not
+    just back under it. This prevents rapid cool/fan-only cycling right
+    at the ceiling boundary. This is a hard rail, not a discretionary
+    decision — it always bypasses the override pause and the
+    mode-switch short-cycle guard.
   - LAYER 2 — Forecast-aware pre-cooling: periodically (every
     forecast_check_interval_cycles cycles, not every cycle, to respect
     weather API rate limits) fetches today's forecast high via
@@ -40,17 +44,16 @@ Key design decisions:
     outdoor-trend pre-cool cut. Fails safe — any fetch error just
     skips forecast-based tightening for that cycle, never blocks
     the main control loop.
-  - STUCK-COMMAND DETECTION (this patch): the controller previously had
-    no way to tell "I sent a forced-cool command" apart from "the AC
-    actually obeyed it." If a ceiling-forced correction is sent but the
-    coordinator's NEXT real poll still reports the same pre-correction
-    mode, that's tracked as a consecutive failure. After 3 consecutive
-    failures, a single loud ERROR is logged (instead of an endless
-    stream of identical WARNINGs) pointing at a hardware/communication
-    problem rather than a logic problem. A forced coordinator refresh
-    is also requested immediately after every command is sent, so the
-    next cycle sees ground truth instead of trusting stale optimistic
-    state for a full poll interval.
+  - STUCK-COMMAND DETECTION: the controller tracks whether a
+    ceiling-forced correction actually took effect on the real device.
+    If the coordinator's NEXT real poll still reports the same
+    pre-correction mode across 3 consecutive attempts, a single loud
+    ERROR is logged (instead of an endless stream of identical
+    WARNINGs) pointing at a hardware/communication problem rather than
+    a logic problem. A forced coordinator refresh is also requested
+    immediately after every command is sent, so the next cycle sees
+    ground truth instead of trusting stale optimistic state for a full
+    poll interval.
   - Entity push notifications: sensors use should_poll=False, so every
     cycle that updates current_target_f / last_mode explicitly calls
     _notify_entities().
@@ -80,7 +83,7 @@ from .const import (
     CONF_PRECOOL_RISE_THRESHOLD, CONF_PRECOOL_TOLERANCE_CUT,
     CONF_LEARNING_LOG_ENABLED, CONF_LEARNING_LOG_SIZE,
     CONF_SAFETY_OVERRIDE_DELTA,
-    CONF_FAN_CEILING_ENABLED, CONF_FAN_CEILING_TEMP,
+    CONF_FAN_CEILING_ENABLED, CONF_FAN_CEILING_TEMP, CONF_FAN_CEILING_HYSTERESIS,
     CONF_WEATHER_ENTITY, CONF_FORECAST_PRECOOL_ENABLED,
     CONF_FORECAST_HIGH_THRESHOLD, CONF_FORECAST_PRECOOL_TOLERANCE_CUT,
     CONF_FORECAST_CHECK_INTERVAL_CYCLES,
@@ -96,7 +99,7 @@ from .const import (
     DEFAULT_PRECOOL_RISE_THRESHOLD, DEFAULT_PRECOOL_TOLERANCE_CUT,
     DEFAULT_LEARNING_LOG_ENABLED, DEFAULT_LEARNING_LOG_SIZE,
     DEFAULT_SAFETY_OVERRIDE_DELTA,
-    DEFAULT_FAN_CEILING_ENABLED, DEFAULT_FAN_CEILING_TEMP,
+    DEFAULT_FAN_CEILING_ENABLED, DEFAULT_FAN_CEILING_TEMP, DEFAULT_FAN_CEILING_HYSTERESIS,
     DEFAULT_FORECAST_PRECOOL_ENABLED, DEFAULT_FORECAST_HIGH_THRESHOLD,
     DEFAULT_FORECAST_PRECOOL_TOLERANCE_CUT, DEFAULT_FORECAST_CHECK_INTERVAL_CYCLES,
     OUTDOOR_TREND_WINDOW_SECONDS,
@@ -152,6 +155,9 @@ class SmartTemperatureController:
         self._consecutive_ceiling_failures: int = 0
         self._last_ceiling_command_mode: str | None = None
         self._stuck_command_alerted: bool = False
+
+        # Ceiling hysteresis latch
+        self._ceiling_active: bool = False
 
     # ------------------------------------------------------------------ live entry
 
@@ -243,10 +249,7 @@ class SmartTemperatureController:
     # ------------------------------------------------------------------ Layer 2: forecast
 
     async def _maybe_refresh_forecast(self) -> None:
-        """Fetch today's forecast high every N cycles (not every cycle,
-        to respect weather API rate limits). Fails safe — any error just
-        clears the cached forecast so forecast-based tightening is
-        skipped, never raises into the main control loop."""
+        """Fetch today's forecast high every N cycles. Fails safe."""
         if not self._opt(CONF_FORECAST_PRECOOL_ENABLED, DEFAULT_FORECAST_PRECOOL_ENABLED):
             return
 
@@ -299,8 +302,6 @@ class SmartTemperatureController:
         return self._forecast_high_f >= threshold
 
     def _effective_tolerance(self) -> float:
-        """Base tolerance, tightened by outdoor-trend pre-cool and/or
-        forecast-based pre-cool. The two cuts stack if both are active."""
         tol = self._opt(CONF_TOLERANCE, DEFAULT_TOLERANCE)
 
         if self._opt(CONF_PRECOOL_ENABLED, DEFAULT_PRECOOL_ENABLED) and self._outdoor_rising_fast():
@@ -376,29 +377,45 @@ class SmartTemperatureController:
         return MODE_FAN
 
     def _apply_fan_ceiling(self, mode: str, htemp_f: float, current_mode: str) -> str:
-        """LAYER 1 — Hard safety ceiling, independent of tolerance math.
+        """LAYER 1 — Hard safety ceiling, with hysteresis to prevent
+        rapid cool/fan-only cycling right at the ceiling boundary.
 
-        If we are currently in fan-only (per the AC's own reported state,
-        not just our computed mode) and indoor temp has climbed above
-        fan_ceiling_temp, force cool regardless of what the tolerance
-        band says. This is a hard rail, not a discretionary choice —
-        callers must treat a ceiling override as always bypassing the
-        manual-override pause and the mode-switch short-cycle guard.
+        Once forced into cool by the ceiling, stays in cool (latched via
+        self._ceiling_active) until htemp drops fan_ceiling_hysteresis
+        degrees BELOW the ceiling (not just back under it), then
+        releases control back to normal mode logic.
         """
         if not self._opt(CONF_FAN_CEILING_ENABLED, DEFAULT_FAN_CEILING_ENABLED):
+            self._ceiling_active = False
+            return mode
+
+        ceiling = self._opt(CONF_FAN_CEILING_TEMP, DEFAULT_FAN_CEILING_TEMP)
+        hysteresis = self._opt(CONF_FAN_CEILING_HYSTERESIS, DEFAULT_FAN_CEILING_HYSTERESIS)
+        release_point = ceiling - hysteresis
+
+        if self._ceiling_active:
+            if htemp_f > release_point:
+                allow_cool = self._opt(CONF_ALLOW_COOL, DEFAULT_ALLOW_COOL)
+                return MODE_COOL if allow_cool else mode
+            _LOGGER.debug(
+                "Fan-only ceiling released — htemp=%.1f°F <= %.1f°F release point",
+                htemp_f, release_point,
+            )
+            self._ceiling_active = False
             return mode
 
         if current_mode != MODE_FAN:
             return mode
 
-        ceiling = self._opt(CONF_FAN_CEILING_TEMP, DEFAULT_FAN_CEILING_TEMP)
         if htemp_f > ceiling:
             allow_cool = self._opt(CONF_ALLOW_COOL, DEFAULT_ALLOW_COOL)
             if allow_cool:
                 _LOGGER.warning(
-                    "Fan-only ceiling exceeded — htemp=%.1f°F > %.1f°F ceiling, forcing cool",
-                    htemp_f, ceiling,
+                    "Fan-only ceiling exceeded — htemp=%.1f°F > %.1f°F ceiling, forcing cool "
+                    "(will hold until htemp <= %.1f°F)",
+                    htemp_f, ceiling, release_point,
                 )
+                self._ceiling_active = True
                 return MODE_COOL
             _LOGGER.warning(
                 "Fan-only ceiling exceeded (htemp=%.1f°F > %.1f°F) but cooling is disabled",
@@ -442,15 +459,6 @@ class SmartTemperatureController:
     # ------------------------------------------------------------------ stuck-command detection
 
     def _track_ceiling_command_result(self, ceiling_forced: bool, current_mode_reported: str, htemp_f: float) -> None:
-        """Detect whether a previously ceiling-forced cool command actually
-        took effect on the real device, by comparing the mode the AC
-        reports NOW against the mode it reported the last time we issued
-        a ceiling-forced correction. If it hasn't changed across several
-        consecutive corrections, the AC is not obeying commands — this
-        is a hardware/communication problem, not a logic problem, and
-        gets escalated to a single loud ERROR instead of an endless
-        stream of identical WARNINGs.
-        """
         if not ceiling_forced:
             self._consecutive_ceiling_failures = 0
             self._last_ceiling_command_mode = None
@@ -576,10 +584,6 @@ class SmartTemperatureController:
             ceiling_forced = True
             fan = self._determine_fan(htemp_f, target_f, outdoor_f)
 
-        # Stuck-command detection — compares this cycle's reported mode
-        # against the mode reported the last time a ceiling correction
-        # was issued, to catch commands that aren't actually taking
-        # effect on the physical unit.
         self._track_ceiling_command_result(ceiling_forced, current_mode_reported, htemp_f)
 
         override_timeout = self._opt(CONF_OVERRIDE_TIMEOUT, DEFAULT_OVERRIDE_TIMEOUT)
@@ -680,10 +684,6 @@ class SmartTemperatureController:
         self.coordinator.set_optimistic_fan_rate(fan)
         self.coordinator.set_optimistic_target_temp(stemp_c)
 
-        # Force an immediate real refresh instead of waiting a full poll
-        # interval on optimistic state alone. This lets the NEXT cycle
-        # see ground truth right away, which is what makes stuck-command
-        # detection above actually meaningful cycle-to-cycle.
         await self.coordinator.async_request_refresh()
 
         self._last_commanded_mode  = mode
