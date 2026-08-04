@@ -41,6 +41,7 @@ CONF_SAFETY_OVERRIDE_DELTA = "safety_override_delta"
 # Layer 1 — hard fan-only ceiling
 CONF_FAN_CEILING_ENABLED = "fan_ceiling_enabled"
 CONF_FAN_CEILING_TEMP = "fan_ceiling_temp"
+CONF_FAN_CEILING_HYSTERESIS = "fan_ceiling_hysteresis"
 
 # Layer 2 — forecast-aware pre-cooling
 CONF_WEATHER_ENTITY = "weather_entity"
@@ -103,6 +104,7 @@ DEFAULT_SAFETY_OVERRIDE_DELTA = 4.0
 # Layer 1 defaults
 DEFAULT_FAN_CEILING_ENABLED = True
 DEFAULT_FAN_CEILING_TEMP = 70.0
+DEFAULT_FAN_CEILING_HYSTERESIS = 2.0
 
 # Layer 2 defaults
 DEFAULT_FORECAST_PRECOOL_ENABLED = False
@@ -110,4 +112,5 @@ DEFAULT_FORECAST_HIGH_THRESHOLD = 90.0
 DEFAULT_FORECAST_PRECOOL_TOLERANCE_CUT = 0.5
 DEFAULT_FORECAST_CHECK_INTERVAL_CYCLES = 15
 
+# Outdoor trend tracking window, in seconds
 OUTDOOR_TREND_WINDOW_SECONDS = 1800
