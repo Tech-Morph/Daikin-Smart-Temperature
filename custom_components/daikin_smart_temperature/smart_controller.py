@@ -40,6 +40,17 @@ Key design decisions:
     outdoor-trend pre-cool cut. Fails safe — any fetch error just
     skips forecast-based tightening for that cycle, never blocks
     the main control loop.
+  - STUCK-COMMAND DETECTION (this patch): the controller previously had
+    no way to tell "I sent a forced-cool command" apart from "the AC
+    actually obeyed it." If a ceiling-forced correction is sent but the
+    coordinator's NEXT real poll still reports the same pre-correction
+    mode, that's tracked as a consecutive failure. After 3 consecutive
+    failures, a single loud ERROR is logged (instead of an endless
+    stream of identical WARNINGs) pointing at a hardware/communication
+    problem rather than a logic problem. A forced coordinator refresh
+    is also requested immediately after every command is sent, so the
+    next cycle sees ground truth instead of trusting stale optimistic
+    state for a full poll interval.
   - Entity push notifications: sensors use should_poll=False, so every
     cycle that updates current_target_f / last_mode explicitly calls
     _notify_entities().
@@ -104,6 +115,8 @@ _SLOTS = [
     (dtime(22, 0), dtime(6,  0), CONF_NIGHT_OFFSET),
 ]
 
+_STUCK_COMMAND_THRESHOLD = 3
+
 
 def _c_to_f(c: float) -> float:
     return c * 9 / 5 + 32
@@ -131,10 +144,14 @@ class SmartTemperatureController:
         self._outdoor_history: deque[tuple[float, float]] = deque()
         self._cycle_log: deque[dict] = deque()
 
-        # Layer 2 — forecast cache
         self._cycle_count: int = 0
         self._forecast_high_f: float | None = None
         self._forecast_fetch_failed: bool = False
+
+        # Stuck-command detection
+        self._consecutive_ceiling_failures: int = 0
+        self._last_ceiling_command_mode: str | None = None
+        self._stuck_command_alerted: bool = False
 
     # ------------------------------------------------------------------ live entry
 
@@ -266,7 +283,10 @@ class SmartTemperatureController:
             _LOGGER.debug("Forecast high refreshed: %.1f°F", self._forecast_high_f)
         except Exception:  # noqa: BLE001
             if not self._forecast_fetch_failed:
-                _LOGGER.warning("Forecast fetch failed for %s — skipping forecast pre-cool this cycle", weather_entity, exc_info=True)
+                _LOGGER.warning(
+                    "Forecast fetch failed for %s — skipping forecast pre-cool this cycle",
+                    weather_entity, exc_info=True,
+                )
             self._forecast_fetch_failed = True
             self._forecast_high_f = None
 
@@ -419,6 +439,42 @@ class SmartTemperatureController:
             or (last_stemp_f is not None and abs(current_stemp_f - last_stemp_f) >= 1)
         )
 
+    # ------------------------------------------------------------------ stuck-command detection
+
+    def _track_ceiling_command_result(self, ceiling_forced: bool, current_mode_reported: str, htemp_f: float) -> None:
+        """Detect whether a previously ceiling-forced cool command actually
+        took effect on the real device, by comparing the mode the AC
+        reports NOW against the mode it reported the last time we issued
+        a ceiling-forced correction. If it hasn't changed across several
+        consecutive corrections, the AC is not obeying commands — this
+        is a hardware/communication problem, not a logic problem, and
+        gets escalated to a single loud ERROR instead of an endless
+        stream of identical WARNINGs.
+        """
+        if not ceiling_forced:
+            self._consecutive_ceiling_failures = 0
+            self._last_ceiling_command_mode = None
+            self._stuck_command_alerted = False
+            return
+
+        if self._last_ceiling_command_mode == current_mode_reported:
+            self._consecutive_ceiling_failures += 1
+        else:
+            self._consecutive_ceiling_failures = 0
+
+        self._last_ceiling_command_mode = current_mode_reported
+
+        if self._consecutive_ceiling_failures >= _STUCK_COMMAND_THRESHOLD and not self._stuck_command_alerted:
+            _LOGGER.error(
+                "AC not responding to forced-cool commands — %d consecutive attempts "
+                "at htemp=%.1f°F have NOT changed the reported mode from fan-only. "
+                "This indicates a hardware/communication failure between "
+                "daikin_comfort_control and the physical unit, not a logic issue in "
+                "this integration. Check the unit and its WiFi adapter directly.",
+                self._consecutive_ceiling_failures, htemp_f,
+            )
+            self._stuck_command_alerted = True
+
     # ------------------------------------------------------------------ learning log
 
     def _record_cycle(self, outdoor_f: float, htemp_f: float, target_f: float, mode: str) -> None:
@@ -513,15 +569,18 @@ class SmartTemperatureController:
         mode = self._determine_mode(htemp_f, target_f, outdoor_f)
         fan  = self._determine_fan(htemp_f, target_f, outdoor_f)
 
-        # LAYER 1 — hard ceiling check, evaluated against the AC's
-        # actual current reported mode (not our computed mode), so it
-        # catches the real-world "stuck in fan-only and climbing" case.
         ceiling_forced = False
         pre_ceiling_mode = mode
         mode = self._apply_fan_ceiling(mode, htemp_f, current_mode_reported)
         if mode != pre_ceiling_mode:
             ceiling_forced = True
-            fan = self._determine_fan(htemp_f, target_f, outdoor_f)  # recompute fan for new mode context
+            fan = self._determine_fan(htemp_f, target_f, outdoor_f)
+
+        # Stuck-command detection — compares this cycle's reported mode
+        # against the mode reported the last time a ceiling correction
+        # was issued, to catch commands that aren't actually taking
+        # effect on the physical unit.
+        self._track_ceiling_command_result(ceiling_forced, current_mode_reported, htemp_f)
 
         override_timeout = self._opt(CONF_OVERRIDE_TIMEOUT, DEFAULT_OVERRIDE_TIMEOUT)
         if override_timeout > 0 and self._detect_manual_override(
@@ -537,7 +596,6 @@ class SmartTemperatureController:
         is_deescalation  = mode == MODE_FAN
 
         if ceiling_forced:
-            # Hard safety rail — always bypasses override pause entirely.
             if override_active:
                 _LOGGER.warning("Ceiling override bypassing active manual-override pause")
                 self._override_until = 0.0
@@ -598,7 +656,10 @@ class SmartTemperatureController:
         elif mode_changed and bypass_switch_guard and (now - self._last_mode_switch_at) < self._opt(
             CONF_MODE_SWITCH_MIN, DEFAULT_MODE_SWITCH_MIN
         ):
-            _LOGGER.warning("Mode-switch guard bypassed (ceiling=%s, safety_delta=%s)", ceiling_forced, delta_now >= safety_delta)
+            _LOGGER.warning(
+                "Mode-switch guard bypassed (ceiling=%s, safety_delta=%s)",
+                ceiling_forced, delta_now >= safety_delta,
+            )
 
         params: dict[str, Any] = {
             "pow":      "1",
@@ -618,6 +679,12 @@ class SmartTemperatureController:
         self.coordinator.set_optimistic_mode(int(mode))
         self.coordinator.set_optimistic_fan_rate(fan)
         self.coordinator.set_optimistic_target_temp(stemp_c)
+
+        # Force an immediate real refresh instead of waiting a full poll
+        # interval on optimistic state alone. This lets the NEXT cycle
+        # see ground truth right away, which is what makes stuck-command
+        # detection above actually meaningful cycle-to-cycle.
+        await self.coordinator.async_request_refresh()
 
         self._last_commanded_mode  = mode
         self._last_commanded_fan   = fan
