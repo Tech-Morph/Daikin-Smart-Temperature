@@ -1,7 +1,7 @@
 {
   "domain": "daikin_smart_temperature",
   "name": "Daikin Comfort Control Smart Temperature",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "documentation": "https://github.com/Tech-Morph/Daikin-Smart-Temperature",
   "issue_tracker": "https://github.com/Tech-Morph/Daikin-Smart-Temperature/issues",
   "dependencies": [

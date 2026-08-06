@@ -53,10 +53,14 @@ Key design decisions:
     a logic problem, AND a persistent_notification is created so the
     incident surfaces directly in the HA UI notification tray instead
     of requiring a log dig after the fact. The notification is
-    automatically dismissed once the ceiling condition clears. A
-    forced coordinator refresh is also requested immediately after
-    every command is sent, so the next cycle sees ground truth instead
-    of trusting stale optimistic state for a full poll interval.
+    automatically dismissed once the ceiling condition clears OR once
+    the reported mode actually reaches MODE_COOL — a mode that stays
+    "cool" for many consecutive cycles (e.g. the hysteresis latch
+    holding cool for hours on a hot day) is SUCCESS, not a stall, and
+    must not trip the failure counter. A forced coordinator refresh is
+    also requested immediately after every command is sent, so the
+    next cycle sees ground truth instead of trusting stale optimistic
+    state for a full poll interval.
   - Entity push notifications: sensors use should_poll=False, so every
     cycle that updates current_target_f / last_mode explicitly calls
     _notify_entities().
@@ -469,6 +473,18 @@ class SmartTemperatureController:
                 persistent_notification.async_dismiss(self.hass, _STUCK_COMMAND_NOTIFICATION_ID)
             self._consecutive_ceiling_failures = 0
             self._last_ceiling_command_mode = None
+            self._stuck_command_alerted = False
+            return
+
+        if current_mode_reported == MODE_COOL:
+            # The ceiling-forced correction has taken effect — this is
+            # success, not a stall. A mode that stays "cool" across many
+            # consecutive cycles (e.g. while the hysteresis latch holds
+            # cool for hours on a hot day) must NOT be misread as "stuck."
+            if self._stuck_command_alerted:
+                persistent_notification.async_dismiss(self.hass, _STUCK_COMMAND_NOTIFICATION_ID)
+            self._consecutive_ceiling_failures = 0
+            self._last_ceiling_command_mode = current_mode_reported
             self._stuck_command_alerted = False
             return
 
