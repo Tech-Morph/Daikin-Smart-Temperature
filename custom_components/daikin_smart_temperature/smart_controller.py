@@ -50,10 +50,13 @@ Key design decisions:
     pre-correction mode across 3 consecutive attempts, a single loud
     ERROR is logged (instead of an endless stream of identical
     WARNINGs) pointing at a hardware/communication problem rather than
-    a logic problem. A forced coordinator refresh is also requested
-    immediately after every command is sent, so the next cycle sees
-    ground truth instead of trusting stale optimistic state for a full
-    poll interval.
+    a logic problem, AND a persistent_notification is created so the
+    incident surfaces directly in the HA UI notification tray instead
+    of requiring a log dig after the fact. The notification is
+    automatically dismissed once the ceiling condition clears. A
+    forced coordinator refresh is also requested immediately after
+    every command is sent, so the next cycle sees ground truth instead
+    of trusting stale optimistic state for a full poll interval.
   - Entity push notifications: sensors use should_poll=False, so every
     cycle that updates current_target_f / last_mode explicitly calls
     _notify_entities().
@@ -67,6 +70,7 @@ from collections import deque
 from datetime import datetime, time as dtime
 from typing import Any
 
+from homeassistant.components import persistent_notification
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
@@ -119,6 +123,7 @@ _SLOTS = [
 ]
 
 _STUCK_COMMAND_THRESHOLD = 3
+_STUCK_COMMAND_NOTIFICATION_ID = "daikin_smart_temperature_stuck_command"
 
 
 def _c_to_f(c: float) -> float:
@@ -460,6 +465,8 @@ class SmartTemperatureController:
 
     def _track_ceiling_command_result(self, ceiling_forced: bool, current_mode_reported: str, htemp_f: float) -> None:
         if not ceiling_forced:
+            if self._stuck_command_alerted:
+                persistent_notification.async_dismiss(self.hass, _STUCK_COMMAND_NOTIFICATION_ID)
             self._consecutive_ceiling_failures = 0
             self._last_ceiling_command_mode = None
             self._stuck_command_alerted = False
@@ -473,13 +480,21 @@ class SmartTemperatureController:
         self._last_ceiling_command_mode = current_mode_reported
 
         if self._consecutive_ceiling_failures >= _STUCK_COMMAND_THRESHOLD and not self._stuck_command_alerted:
-            _LOGGER.error(
-                "AC not responding to forced-cool commands — %d consecutive attempts "
-                "at htemp=%.1f°F have NOT changed the reported mode from fan-only. "
-                "This indicates a hardware/communication failure between "
-                "daikin_comfort_control and the physical unit, not a logic issue in "
-                "this integration. Check the unit and its WiFi adapter directly.",
-                self._consecutive_ceiling_failures, htemp_f,
+            message = (
+                f"AC not responding to forced-cool commands — "
+                f"{self._consecutive_ceiling_failures} consecutive attempts at "
+                f"htemp={htemp_f:.1f}°F have NOT changed the reported mode from "
+                f"'{current_mode_reported}'. This indicates a hardware/communication "
+                "failure between daikin_comfort_control and the physical unit, not a "
+                "logic issue in this integration. Check the unit and its WiFi adapter "
+                "directly."
+            )
+            _LOGGER.error(message)
+            persistent_notification.async_create(
+                self.hass,
+                message,
+                title="Daikin Smart Temperature — AC Not Responding",
+                notification_id=_STUCK_COMMAND_NOTIFICATION_ID,
             )
             self._stuck_command_alerted = True
 
