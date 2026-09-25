@@ -53,13 +53,19 @@
           "fan_mid_delta": "Medium fan threshold (°F from target)",
           "poll_interval": "Poll interval (seconds, min 30)",
           "mode_switch_min": "Min time between mode switches (seconds, min 60)",
-          "override_timeout": "Manual override pause duration (seconds, 0=disabled)"
+          "override_timeout": "Manual override pause duration (seconds, 0=disabled)",
+          "cool_on_delta": "Start cooling above smart target (°F)",
+          "cool_off_delta": "Return to idle above smart target (°F)",
+          "cold_limit_delta": "Cold-limit offset from smart target (°F)",
+          "idle_mode": "Idle mode (fan_only or off)"
         }
       }
     },
     "error": {
       "invalid_temp_range": "Minimum temperature cannot be greater than maximum temperature.",
-      "at_least_one_hvac_mode": "At least one HVAC mode must be enabled."
+      "at_least_one_hvac_mode": "At least one HVAC mode must be enabled.",
+      "invalid_cooling_thresholds": "Require cold limit < cool-off < cool-on offsets.",
+      "fan_idle_disabled": "Enable fan-only or choose Off as idle mode."
     }
   }
 }

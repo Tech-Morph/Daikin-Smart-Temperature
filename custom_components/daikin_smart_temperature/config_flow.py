@@ -41,6 +41,7 @@ from .const import (
     CONF_SAFETY_OVERRIDE_DELTA,
     CONF_FAN_CEILING_ENABLED,
     CONF_FAN_CEILING_TEMP,
+    CONF_COOL_ON_DELTA, CONF_COOL_OFF_DELTA, CONF_COLD_LIMIT_DELTA, CONF_IDLE_MODE,
     CONF_WEATHER_ENTITY,
     CONF_FORECAST_PRECOOL_ENABLED,
     CONF_FORECAST_HIGH_THRESHOLD,
@@ -76,6 +77,8 @@ from .const import (
     DEFAULT_SAFETY_OVERRIDE_DELTA,
     DEFAULT_FAN_CEILING_ENABLED,
     DEFAULT_FAN_CEILING_TEMP,
+DEFAULT_COOL_ON_DELTA, DEFAULT_COOL_OFF_DELTA, DEFAULT_COLD_LIMIT_DELTA, DEFAULT_IDLE_MODE,
+IDLE_FAN_ONLY, IDLE_OFF,
     DEFAULT_FORECAST_PRECOOL_ENABLED,
     DEFAULT_FORECAST_HIGH_THRESHOLD,
     DEFAULT_FORECAST_PRECOOL_TOLERANCE_CUT,
@@ -140,6 +143,10 @@ class DaikinSmartTempOptionsFlow(OptionsFlow):
                 or user_input[CONF_ALLOW_FAN_ONLY]
             ):
                 errors["base"] = "at_least_one_hvac_mode"
+            elif not (user_input[CONF_COLD_LIMIT_DELTA] < user_input[CONF_COOL_OFF_DELTA] < user_input[CONF_COOL_ON_DELTA]):
+                errors["base"] = "invalid_cooling_thresholds"
+            elif user_input[CONF_IDLE_MODE] == IDLE_FAN_ONLY and not user_input[CONF_ALLOW_FAN_ONLY]:
+                errors["base"] = "fan_idle_disabled"
             else:
                 return self.async_create_entry(title="", data=user_input)
 
@@ -174,6 +181,12 @@ class DaikinSmartTempOptionsFlow(OptionsFlow):
                 default=o.get(CONF_OUTDOOR_HEAT_MAX, DEFAULT_OUTDOOR_HEAT_MAX),
             ): vol.Coerce(float),
 
+            # Relative to the effective smart target (including time-of-day offsets).
+            vol.Optional(CONF_COOL_ON_DELTA, default=o.get(CONF_COOL_ON_DELTA, DEFAULT_COOL_ON_DELTA)): vol.All(vol.Coerce(float), vol.Range(min=0.25, max=5.0)),
+            vol.Optional(CONF_COOL_OFF_DELTA, default=o.get(CONF_COOL_OFF_DELTA, DEFAULT_COOL_OFF_DELTA)): vol.All(vol.Coerce(float), vol.Range(min=-1.0, max=4.0)),
+            vol.Optional(CONF_COLD_LIMIT_DELTA, default=o.get(CONF_COLD_LIMIT_DELTA, DEFAULT_COLD_LIMIT_DELTA)): vol.All(vol.Coerce(float), vol.Range(min=-3.0, max=3.0)),
+            vol.Optional(CONF_IDLE_MODE, default=o.get(CONF_IDLE_MODE, DEFAULT_IDLE_MODE)): vol.In([IDLE_FAN_ONLY, IDLE_OFF]),
+
             # Layer 1 — hard fan-only ceiling
             vol.Optional(
                 CONF_FAN_CEILING_ENABLED,
@@ -181,6 +194,7 @@ class DaikinSmartTempOptionsFlow(OptionsFlow):
             ): bool,
             vol.Optional(
                 CONF_FAN_CEILING_TEMP,
+    CONF_COOL_ON_DELTA, CONF_COOL_OFF_DELTA, CONF_COLD_LIMIT_DELTA, CONF_IDLE_MODE,
                 default=o.get(CONF_FAN_CEILING_TEMP, DEFAULT_FAN_CEILING_TEMP),
             ): vol.Coerce(float),
 
