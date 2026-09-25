@@ -106,6 +106,8 @@ class SmartTemperatureController:
         self._cooling_active: bool | None = None
         self._pending_state: tuple[bool, str] | None = None
         self._pending_at: float = 0.0
+        self._pending_fan: str | None = None
+        self._pending_stemp: float | None = None
         self._last_unconfirmed_check: float = 0.0
         self._unconfirmed_count: int = 0
         self._unconfirmed_alerted: bool = False
@@ -236,7 +238,16 @@ class SmartTemperatureController:
                 self._forecast_high_f = None
                 return
 
-            self._forecast_high_f = _c_to_f(float(temp_c))
+            state = self.hass.states.get(weather_entity)
+            unit = state.attributes.get("temperature_unit") if state is not None else None
+            if unit in ("°F", "F"):
+                self._forecast_high_f = float(temp_c)
+            elif unit in ("°C", "C"):
+                self._forecast_high_f = _c_to_f(float(temp_c))
+            else:
+                _LOGGER.debug("Unknown weather temperature unit %r; skipping pre-cool", unit)
+                self._forecast_high_f = None
+                return
             self._forecast_fetch_failed = False
             _LOGGER.debug("Forecast high refreshed: %.1f°F", self._forecast_high_f)
         except Exception:  # noqa: BLE001
@@ -395,12 +406,17 @@ class SmartTemperatureController:
 
     # ------------------------------------------------------------------ stuck-command detection
 
-    def _track_command_confirmation(self, powered: bool, reported_mode: str) -> None:
+    def _track_command_confirmation(self, powered: bool, reported_mode: str,
+                                    reported_fan: str, reported_stemp: float | None) -> None:
         """Confirm from later coordinator readback; a mismatch is not proof of hardware failure."""
         if self._pending_state is None or getattr(self.coordinator, "last_update_success", True) is False:
             return
         expected_power, expected_mode = self._pending_state
-        if powered == expected_power and (not powered or reported_mode == expected_mode):
+        if (powered == expected_power and (not powered or (
+                reported_mode == expected_mode and reported_fan == self._pending_fan
+                and (expected_mode == MODE_FAN or (reported_stemp is not None
+                    and self._pending_stemp is not None
+                    and abs(float(reported_stemp) - self._pending_stemp) < 0.25))))):
             self._pending_state = None
             self._unconfirmed_count = 0
             if self._unconfirmed_alerted:
@@ -416,7 +432,7 @@ class SmartTemperatureController:
         if self._unconfirmed_count >= _STUCK_COMMAND_THRESHOLD and not self._unconfirmed_alerted:
             message = (
                 f"Daikin command power={expected_power}, mode={expected_mode} remains unconfirmed "
-                f"after {self._unconfirmed_count} later checks (power={powered}, mode={reported_mode}). "
+                f"after {self._unconfirmed_count} later checks (power={powered}, mode={reported_mode}, fan={reported_fan}). "
                 "Check cloud readback and the physical unit; the cause is not yet known."
             )
             _LOGGER.error(message)
@@ -492,7 +508,7 @@ class SmartTemperatureController:
         self.current_target_f = target_f
         powered = bool(d.power)
         reported_mode = str(d.mode)
-        self._track_command_confirmation(powered, reported_mode)
+        self._track_command_confirmation(powered, reported_mode, str(d.fan_rate), d.target_temp)
         mode, cold_exit, cold, off, on = self._choose_mode(
             htemp_f, target_f, outdoor_f, reported_mode, powered,
         )
@@ -580,6 +596,8 @@ class SmartTemperatureController:
         self._last_command_at = now
         self._pending_state = desired_state
         self._pending_at = now
+        self._pending_fan = fan if desired_power else None
+        self._pending_stemp = stemp_c if desired_power else None
         self._last_unconfirmed_check = now
         if desired_power:
             self._last_commanded_mode = mode
