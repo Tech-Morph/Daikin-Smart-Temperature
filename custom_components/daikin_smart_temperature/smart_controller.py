@@ -1,69 +1,7 @@
-"""
-SmartTemperatureController
+"""Smart Daikin thermostat with Cool-on, Cool-off, cold-limit and Fan Only idle.
 
-The core brain. Runs as an async HA background task, reads htemp/otemp
-from the daikin_comfort_control coordinator (no extra API calls), and
-issues set_control_info commands when the temperature drifts outside
-the comfort band.
-
-Key design decisions:
-  - Uses hass.async_create_background_task() so HA does NOT track this
-    coroutine as a setup dependency and the bootstrap watchdog never fires.
-  - Sleep is at the END of the loop, so the first cycle runs immediately.
-  - Always resolves the live ConfigEntry via entry_id so options changes
-    take effect on the next poll without a reload.
-  - Respects allow_cool / allow_heat / allow_fan_only toggles.
-  - Caps fan speed at max_fan_mode.
-  - Summer heat gate checks BOTH indoor temp and outdoor temp.
-  - Pre-cooling: tracks outdoor temp over a rolling window; if it's
-    rising quickly, tightens the tolerance band.
-  - Rolling in-memory learning log for future empirical tuning.
-  - Manual-override detection IGNORES setpoint comparisons while the
-    last commanded mode was fan-only (stale/meaningless stemp there).
-  - Safety bypass: a delta from target that reaches safety_override_delta
-    forces the override pause to clear immediately.
-  - De-escalation exception: mode is computed BEFORE the override check.
-    If the freshly-computed mode is fan-only, the override pause is
-    ALWAYS bypassed for that decision — backing off to fan-only is
-    never harmful even if a human touched the unit recently.
-  - LAYER 1 — Hard fan-only ceiling WITH HYSTERESIS: independent of the
-    target/tolerance math, if indoor temp exceeds fan_ceiling_temp while
-    in fan-only, mode is force-overridden to cool immediately. Once
-    forced into cool, it STAYS in cool (self._ceiling_active) until
-    htemp drops fan_ceiling_hysteresis degrees BELOW the ceiling, not
-    just back under it. This prevents rapid cool/fan-only cycling right
-    at the ceiling boundary. This is a hard rail, not a discretionary
-    decision — it always bypasses the override pause and the
-    mode-switch short-cycle guard.
-  - LAYER 2 — Forecast-aware pre-cooling: periodically (every
-    forecast_check_interval_cycles cycles, not every cycle, to respect
-    weather API rate limits) fetches today's forecast high via
-    weather.get_forecasts. If the forecast high exceeds
-    forecast_high_threshold, tolerance is pre-emptively tightened by
-    forecast_precool_tolerance_cut, stacking with the existing
-    outdoor-trend pre-cool cut. Fails safe — any fetch error just
-    skips forecast-based tightening for that cycle, never blocks
-    the main control loop.
-  - STUCK-COMMAND DETECTION: the controller tracks whether a
-    ceiling-forced correction actually took effect on the real device.
-    If the coordinator's NEXT real poll still reports the same
-    pre-correction mode across 3 consecutive attempts, a single loud
-    ERROR is logged (instead of an endless stream of identical
-    WARNINGs) pointing at a hardware/communication problem rather than
-    a logic problem, AND a persistent_notification is created so the
-    incident surfaces directly in the HA UI notification tray instead
-    of requiring a log dig after the fact. The notification is
-    automatically dismissed once the ceiling condition clears OR once
-    the reported mode actually reaches MODE_COOL — a mode that stays
-    "cool" for many consecutive cycles (e.g. the hysteresis latch
-    holding cool for hours on a hot day) is SUCCESS, not a stall, and
-    must not trip the failure counter. A forced coordinator refresh is
-    also requested immediately after every command is sent, so the
-    next cycle sees ground truth instead of trusting stale optimistic
-    state for a full poll interval.
-  - Entity push notifications: sensors use should_poll=False, so every
-    cycle that updates current_target_f / last_mode explicitly calls
-    _notify_entities().
+The cold-limit takes precedence over forecast and ordinary mode timing.
+Reported state is not assumed to prove physical command execution.
 """
 from __future__ import annotations
 
@@ -169,13 +107,12 @@ class SmartTemperatureController:
         self._stuck_command_alerted: bool = False
 
         # Ceiling hysteresis latch
-        self._ceiling_active: bool = False  # legacy, not used for cooling decisions
         self._cooling_active: bool | None = None
         self._pending_mode: str | None = None
         self._pending_at: float = 0.0
-        self._unconfirmed_count: int = 0
-        self._unconfirmed_alerted: bool = False
         self._last_command_at: float = 0.0
+        self._unconfirmed_cycles: int = 0
+        self._state_unconfirmed_alerted: bool = False
 
     # ------------------------------------------------------------------ live entry
 
@@ -378,13 +315,11 @@ class SmartTemperatureController:
         return desired_rate
 
     def _thresholds(self, target_f: float) -> tuple[float, float, float]:
-        """Return cold-limit, cool-off and cool-on, in Fahrenheit.
+        """Cold limit, cooling stop, and cooling start in Fahrenheit.
 
-        Forecasts can only move the on threshold earlier; neither the
-        comfort stop point nor the cold-limit can be lowered by weather.
-        The legacy absolute ceiling can only start cooling sooner when
-        it lies ABOVE the cool-off point; an old ceiling at/below target
-        is ignored rather than cooling down to ceiling minus hysteresis.
+        Trend and forecast may advance the start but never lower the stop
+        or cold-limit. The legacy ceiling can only lower the start if it
+        is ABOVE the stop; an old 68F ceiling no longer cools to 66F.
         """
         cold = target_f + float(self._opt(CONF_COLD_LIMIT_DELTA, DEFAULT_COLD_LIMIT_DELTA))
         off = target_f + float(self._opt(CONF_COOL_OFF_DELTA, DEFAULT_COOL_OFF_DELTA))
@@ -394,7 +329,7 @@ class SmartTemperatureController:
             cold, off, on = target_f - 0.5, target_f + 0.5, target_f + 1.0
         if self._opt(CONF_FAN_CEILING_ENABLED, DEFAULT_FAN_CEILING_ENABLED):
             ceiling = float(self._opt(CONF_FAN_CEILING_TEMP, DEFAULT_FAN_CEILING_TEMP))
-            if ceiling > off + 0.25:
+            if ceiling >= off + 0.25:
                 on = min(on, ceiling)
         if self._opt(CONF_PRECOOL_ENABLED, DEFAULT_PRECOOL_ENABLED) and self._outdoor_rising_fast():
             on -= max(0.0, float(self._opt(CONF_PRECOOL_TOLERANCE_CUT, DEFAULT_PRECOOL_TOLERANCE_CUT)))
@@ -403,24 +338,23 @@ class SmartTemperatureController:
         return cold, off, max(off + 0.25, on)
 
     def _idle_mode(self) -> str:
-        idle = self._opt(CONF_IDLE_MODE, DEFAULT_IDLE_MODE)
-        if idle == IDLE_OFF:
+        if self._opt(CONF_IDLE_MODE, DEFAULT_IDLE_MODE) == IDLE_OFF:
             return IDLE_OFF
-        # Existing installations default to fan-only. A disabled fan-only
-        # option must not silently command a mode that was disallowed.
         return MODE_FAN if self._opt(CONF_ALLOW_FAN_ONLY, DEFAULT_ALLOW_FAN_ONLY) else IDLE_OFF
 
     def _choose_mode(
-        self, indoor_f: float, target_f: float, outdoor_f: float,
-        reported_mode: str,
+        self, indoor_f: float, target_f: float, outdoor_f: float, reported: str,
     ) -> tuple[str, bool, float, float, float]:
-        """Cold limit first; then latched cooling, then optional heating."""
+        """Stop cooling on cold-limit BEFORE any other decision."""
         cold, off, on = self._thresholds(target_f)
         if self._cooling_active is None:
-            self._cooling_active = reported_mode == MODE_COOL
+            self._cooling_active = reported == MODE_COOL
         idle = self._idle_mode()
         if indoor_f <= cold:
+            was_cooling = self._cooling_active or reported == MODE_COOL
             self._cooling_active = False
+            if not was_cooling and indoor_f < target_f - self._effective_tolerance() and self._heat_allowed_now(indoor_f, outdoor_f):
+                return MODE_HEAT, False, cold, off, on
             return idle, True, cold, off, on
         if self._cooling_active and indoor_f <= off:
             self._cooling_active = False
@@ -467,39 +401,32 @@ class SmartTemperatureController:
 
     # ------------------------------------------------------------------ stuck-command detection
 
-    def _track_command_confirmation(self, reported_mode: str) -> None:
-        """Only warn after repeated unsuccessful refresh attempts.
-
-        A mismatch is unconfirmed state, not proof of an adapter defect.
-        The pending command is given time to propagate before counting it.
-        """
+    def _track_command_confirmation(self, reported: str) -> None:
+        """Treat nonmatching readback as uncertain, not a proven hardware fault."""
         if self._pending_mode is None:
             return
-        if reported_mode == self._pending_mode:
+        if reported == self._pending_mode:
             self._pending_mode = None
-            self._unconfirmed_count = 0
-            if self._unconfirmed_alerted:
+            self._unconfirmed_cycles = 0
+            if self._state_unconfirmed_alerted:
                 persistent_notification.async_dismiss(self.hass, _STUCK_COMMAND_NOTIFICATION_ID)
-                _LOGGER.info("Daikin command confirmed by device readback")
-            self._unconfirmed_alerted = False
+                _LOGGER.info("Daikin mode change now matches reported state")
+            self._state_unconfirmed_alerted = False
             return
-        if time.monotonic() - self._pending_at < 60:
+        if time.monotonic() - self._pending_at < 90 or not getattr(self.coordinator, "last_update_success", True):
             return
-        if getattr(self.coordinator, "last_update_success", True) is False:
-            return
-        self._unconfirmed_count += 1
-        if self._unconfirmed_count >= 3 and not self._unconfirmed_alerted:
-            message = (
-                f"Daikin mode command {self._pending_mode} has not been confirmed "
-                f"by three later coordinator cycles (reported {reported_mode}). "
-                "Check cloud updates and the physical unit; the cause is not yet known."
+        self._unconfirmed_cycles += 1
+        if self._unconfirmed_cycles >= 3 and not self._state_unconfirmed_alerted:
+            msg = (
+                f"Daikin mode {self._pending_mode} remains unconfirmed after multiple polls "
+                f"(reported {reported}). Check the unit and cloud connection."
             )
-            _LOGGER.error(message)
+            _LOGGER.error(msg)
             persistent_notification.async_create(
-                self.hass, message, title="Daikin command unconfirmed",
+                self.hass, msg, title="Daikin mode unconfirmed",
                 notification_id=_STUCK_COMMAND_NOTIFICATION_ID,
             )
-            self._unconfirmed_alerted = True
+            self._state_unconfirmed_alerted = True
 
     # ------------------------------------------------------------------ learning log
 
