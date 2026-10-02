@@ -41,6 +41,15 @@ CONF_SAFETY_OVERRIDE_DELTA = "safety_override_delta"
 # Layer 1 — hard fan-only ceiling
 CONF_FAN_CEILING_ENABLED = "fan_ceiling_enabled"
 CONF_FAN_CEILING_TEMP = "fan_ceiling_temp"
+CONF_FAN_CEILING_HYSTERESIS = "fan_ceiling_hysteresis"
+
+# Thermostat thresholds are offsets from the effective target in Fahrenheit.
+CONF_COOL_ON_DELTA = "cool_on_delta"
+CONF_COOL_OFF_DELTA = "cool_off_delta"
+CONF_COLD_LIMIT_DELTA = "cold_limit_delta"
+CONF_IDLE_MODE = "idle_mode"
+IDLE_FAN_ONLY = "fan_only"
+IDLE_OFF = "off"
 
 # Layer 2 — forecast-aware pre-cooling
 CONF_WEATHER_ENTITY = "weather_entity"
@@ -50,9 +59,9 @@ CONF_FORECAST_PRECOOL_TOLERANCE_CUT = "forecast_precool_tolerance_cut"
 CONF_FORECAST_CHECK_INTERVAL_CYCLES = "forecast_check_interval_cycles"
 
 FAN_RATE_AUTO = "A"
-FAN_RATE_LOW = "2"
-FAN_RATE_MEDIUM = "3"
-FAN_RATE_HIGH = "4"
+FAN_RATE_LOW = "3"
+FAN_RATE_MEDIUM = "5"
+FAN_RATE_HIGH = "7"
 
 MODE_COOL = "3"
 MODE_HEAT = "4"
@@ -103,6 +112,12 @@ DEFAULT_SAFETY_OVERRIDE_DELTA = 4.0
 # Layer 1 defaults
 DEFAULT_FAN_CEILING_ENABLED = True
 DEFAULT_FAN_CEILING_TEMP = 70.0
+DEFAULT_FAN_CEILING_HYSTERESIS = 2.0
+
+DEFAULT_COOL_ON_DELTA = 1.0
+DEFAULT_COOL_OFF_DELTA = 0.5
+DEFAULT_COLD_LIMIT_DELTA = -0.5
+DEFAULT_IDLE_MODE = IDLE_FAN_ONLY
 
 # Layer 2 defaults
 DEFAULT_FORECAST_PRECOOL_ENABLED = False
@@ -110,4 +125,5 @@ DEFAULT_FORECAST_HIGH_THRESHOLD = 90.0
 DEFAULT_FORECAST_PRECOOL_TOLERANCE_CUT = 0.5
 DEFAULT_FORECAST_CHECK_INTERVAL_CYCLES = 15
 
+# Outdoor trend tracking window, in seconds
 OUTDOOR_TREND_WINDOW_SECONDS = 1800
